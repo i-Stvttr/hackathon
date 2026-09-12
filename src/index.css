@@ -1,0 +1,48 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&display=swap');
+@import 'tailwindcss';
+
+@theme inline {
+  --color-background: #f6f9fc;
+  --color-foreground: #0d1f2d;
+  --color-card: #ffffff;
+  --color-card-foreground: #0d1f2d;
+  --color-primary: #004977;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #e6f2f8;
+  --color-secondary-foreground: #004977;
+  --color-muted: #eef3f7;
+  --color-muted-foreground: #5a7a91;
+  --color-accent: #2a9d8f;
+  --color-accent-foreground: #ffffff;
+  --color-border: #c8dde9;
+  --color-ring: #004977;
+  --color-warning: #c4834a;
+  --color-warning-bg: #fef6ee;
+  --color-danger: #c0392b;
+  --color-danger-bg: #fdf0ef;
+  --radius: 16px;
+
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+  --font-serif: 'DM Serif Display', Georgia, serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  margin: 0;
+}
+
+::-webkit-scrollbar {
+  width: 0;
+  background: transparent;
+}
