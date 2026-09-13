@@ -65,7 +65,7 @@ export default function IncomePredictabilityStep({ onNext, onBack }: Props) {
           How predictable is your income?
         </h1>
         <p className="text-sm text-[var(--color-muted-foreground)] leading-relaxed">
-          This helps CapFrog plan around your cash flow rhythm.
+          This helps CapiFrog plan around your cash flow rhythm.
         </p>
       </div>
 

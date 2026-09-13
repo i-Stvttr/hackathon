@@ -89,7 +89,7 @@ export default function FinancialGoalsStep({ onComplete, onBack }: Props) {
           What would you like to strengthen?
         </h1>
         <p className="text-sm text-[var(--color-muted-foreground)] leading-relaxed">
-          Choose up to two priorities. CapFrog will focus on these first.
+          Choose up to two priorities. CapiFrog will focus on these first.
         </p>
       </div>
 

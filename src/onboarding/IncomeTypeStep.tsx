@@ -161,7 +161,7 @@ export default function IncomeTypeStep({ onNext }: Props) {
       )}
 
       <p className="text-[11px] text-[var(--color-muted-foreground)] text-center mb-5 leading-relaxed">
-        No traditional paycheck? No problem. CapFrog is built to understand variable ways of earning.
+        No traditional paycheck? No problem. CapiFrog is built to understand variable ways of earning.
       </p>
 
       <button

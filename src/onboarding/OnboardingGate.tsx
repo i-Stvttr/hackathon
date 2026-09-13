@@ -2,10 +2,12 @@ import { useEffect, useState } from "react";
 import App from "../App";
 import OnboardingFlow from "./OnboardingFlow";
 
-const ONBOARDING_COMPLETE_KEY = "capfrog_onboarding_complete";
-const ONBOARDING_DATA_KEY = "capfrog_onboarding_data";
+// Exported so App.tsx (the user-icon "edit profile" re-cycle) reads/writes
+// the exact same storage this gate uses for first-run onboarding.
+export const ONBOARDING_COMPLETE_KEY = "capfrog_onboarding_complete";
+export const ONBOARDING_DATA_KEY = "capfrog_onboarding_data";
 
-interface OnboardingAnswers {
+export interface OnboardingAnswers {
   incomeTypes: {
     selected: string[];
     primary: string | null;
@@ -22,7 +24,7 @@ interface OnboardingAnswers {
   };
 }
 
-interface StoredOnboardingData {
+export interface StoredOnboardingData {
   answers: OnboardingAnswers;
   completedAt: string;
 }

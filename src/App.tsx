@@ -5,9 +5,11 @@ import frogMedium     from "@/imports/MONEY_GETTING_TIGHT_.jpeg";
 import frogHigh       from "@/imports/SAVINGS.jpeg";
 import {
   getUsuario, getRevision, getMonitoreo,
-  editarCuentas, aplicarPreset,
+  editarUsuario, editarCuentas, aplicarPreset,
   simular, transferirPreview, transferir, chatear,
 } from "./api";
+import ProfileUpdateFlow, { type ProfileAnswers } from "./onboarding/ProfileUpdateFlow";
+import { ONBOARDING_DATA_KEY, type StoredOnboardingData } from "./onboarding/OnboardingGate";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 type RiskState  = "stable" | "medium" | "high";
@@ -135,6 +137,35 @@ const VEREDICTO_LABELS: Record<string, string> = {
 // POST /preset/{nombre}. Tap the Capital One logo 5× to cycle through them.
 const PRESET_CYCLE = ["sano", "ajustado", "critico"] as const;
 
+// ─── Onboarding profile → backend feature ──────────────────────────────────
+// The only onboarding answer with a real counterpart in the risk model is
+// income predictability — that's exactly backend/features.py's
+// "estabilidad_ingreso" (0-1), which the trained model already uses. This is
+// the one honest bridge from the onboarding questions to an actual
+// prediction change; "goals" only re-prioritizes the Safe to Save pick
+// client-side (see topBucket()) since the backend has no goals concept.
+function estimateEstabilidad(p: ProfileAnswers["predictability"]): number {
+  const base: Record<string, number> = { same: 0.9, somewhat: 0.65, alot: 0.4, project: 0.35, unsure: 0.5 };
+  const adj:  Record<string, number> = { several: 0.05, one_two: 0, onetime: -0.05, unsure: 0 };
+  const v = (base[p.predictability] ?? 0.5) + (adj[p.recurring] ?? 0);
+  return Math.min(1, Math.max(0, v));
+}
+
+function readStoredProfile(): ProfileAnswers | null {
+  try {
+    const raw = window.localStorage.getItem(ONBOARDING_DATA_KEY);
+    if (!raw) return null;
+    return (JSON.parse(raw) as StoredOnboardingData).answers ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function storeProfile(answers: ProfileAnswers) {
+  const payload: StoredOnboardingData = { answers, completedAt: new Date().toISOString() };
+  window.localStorage.setItem(ONBOARDING_DATA_KEY, JSON.stringify(payload));
+}
+
 // ─── Static per-tier styling (frog art + badge colors only — numbers below
 // are always real, fetched from the backend) ───────────────────────────────
 const RISK_STYLE: Record<RiskState, {
@@ -189,32 +220,52 @@ function buildAccounts(cuentas: Cuentas, plan: Plan | null): Account[] {
   });
 }
 
-// A one-line fallback for the Home hero while the real Gemini narration
-// (fetched separately via GET /revision) hasn't loaded yet.
-function fallbackSummary(risk: RiskState, riesgo: Riesgo, plan: Plan | null): string {
+// A short, static bullet summary for the Home hero — the single most
+// important facts, computed directly from real numbers (no Gemini call
+// needed, so it's never blank and never flaky).
+function keyInsights(risk: RiskState, riesgo: Riesgo, plan: Plan | null): string {
   const cushion = riesgo.meses_colchon.toFixed(1);
   const driver  = riesgo.drivers[0] ? (DRIVER_LABELS[riesgo.drivers[0]] ?? riesgo.drivers[0]) : null;
-  const money   = plan && plan.excedente_mensual > 0
-    ? `$${Math.round(plan.excedente_mensual)} is safe to save this month.`
-    : "Your budget is tight this month.";
-  if (risk === "stable") return `You're on track, with about ${cushion} months of cushion. ${money}`;
-  return `You're at ${RISK_STYLE[risk].label.toLowerCase()}, with about ${cushion} months of cushion${driver ? ` — mainly due to ${driver}` : ""}. ${money}`;
+  const lines = [`- ${RISK_STYLE[risk].label} — about ${cushion} months of cushion`];
+  if (plan && plan.excedente_mensual > 0) lines.push(`- $${Math.round(plan.excedente_mensual)} is safe to save this month`);
+  else lines.push("- Budget is tight this month — nothing extra to save");
+  if (driver) lines.push(`- Main factor: ${driver}`);
+  return lines.join("\n");
+}
+
+// Which savings bucket to lead with in "Safe to Save" — amount-highest by
+// default, but a bucket tied to one of the user's onboarding goals (see
+// src/onboarding) wins among buckets that actually have money to move.
+const GOAL_TO_BUCKET: Record<string, keyof Plan["aportaciones"]> = {
+  emergency: "fondo_lluvia",
+  irregular: "fondo_lluvia",
+  slow:      "fondo_lluvia",
+  shortterm: "corto_plazo",
+  save:      "alto_rendimiento",
+};
+
+function topBucket(plan: Plan, goals: string[] = []) {
+  const buckets = [
+    { key: "fondo_lluvia" as const,     label: "Emergency Fund",     amount: plan.aportaciones.fondo_lluvia },
+    { key: "alto_rendimiento" as const, label: "High-Yield Savings", amount: plan.aportaciones.alto_rendimiento },
+    { key: "corto_plazo" as const,      label: "Short-term Savings", amount: plan.aportaciones.corto_plazo },
+  ];
+  const positive  = buckets.filter((b) => b.amount > 0);
+  const pool      = positive.length ? positive : buckets;
+  const preferred = new Set(goals.map((g) => GOAL_TO_BUCKET[g]).filter(Boolean));
+  const preferredPool = pool.filter((b) => preferred.has(b.key));
+  return (preferredPool.length ? preferredPool : pool).sort((a, b) => b.amount - a.amount)[0];
 }
 
 // Derives a 0-100 "credit readiness" style score directly from the trained
 // risk model's probability, so it can never contradict the risk badge the
 // way a hardcoded score could. There's no separate credit-score model on
 // the backend — this is the same number the risk badge is built from.
-function creditReadiness(riesgo: Riesgo, plan: Plan | null) {
+function creditReadiness(riesgo: Riesgo, plan: Plan | null, goals: string[] = []) {
   const score = Math.max(0, Math.min(100, Math.round((1 - riesgo.probabilidad) * 100)));
   const label = score >= 70 ? "Building Strongly" : score >= 40 ? "Needs Attention" : "At Risk";
   const trend = score >= 40 ? "↑" : "↓";
-  const buckets = plan ? [
-    { label: "Rainy Day Fund",     amount: plan.aportaciones.fondo_lluvia },
-    { label: "High-Yield Savings", amount: plan.aportaciones.alto_rendimiento },
-    { label: "Short-term Savings", amount: plan.aportaciones.corto_plazo },
-  ].sort((a, b) => b.amount - a.amount) : [];
-  const top = buckets[0];
+  const top = plan ? topBucket(plan, goals) : null;
   const action = top && top.amount > 0
     ? `Add $${Math.round(top.amount)} to your ${top.label}.`
     : "Keep an eye on your monthly spending.";
@@ -223,7 +274,7 @@ function creditReadiness(riesgo: Riesgo, plan: Plan | null) {
 
 // Renders Gemini-authored text (backend/gemini_texto.py) with real paragraph
 // and line breaks instead of one squished block — the SISTEM prompt asks for
-// blank-line-separated paragraphs and no markdown, so this is plain-text only.
+// blank-line-separated paragraphs, dash-bullets for lists, and no markdown.
 function splitParagraphs(text: string): string[] {
   return text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
 }
@@ -232,13 +283,30 @@ function FormattedText({ text, className = "" }: { text: string; className?: str
   const paragraphs = splitParagraphs(text);
   return (
     <>
-      {paragraphs.map((p, i) => (
-        <p key={i} className={`${className} ${i < paragraphs.length - 1 ? "mb-2" : ""}`}>
-          {p.split("\n").map((line, j, arr) => (
-            <span key={j}>{line}{j < arr.length - 1 && <br/>}</span>
-          ))}
-        </p>
-      ))}
+      {paragraphs.map((para, i) => {
+        const lines  = para.split("\n").map((l) => l.trim()).filter(Boolean);
+        const isList = lines.length > 0 && lines.every((l) => l.startsWith("- "));
+        const spacing = i < paragraphs.length - 1 ? "mb-2" : "";
+        if (isList) {
+          return (
+            <ul key={i} className={`${className} ${spacing} space-y-1`}>
+              {lines.map((l, j) => (
+                <li key={j} className="flex gap-1.5">
+                  <span aria-hidden="true">•</span>
+                  <span>{l.slice(2)}</span>
+                </li>
+              ))}
+            </ul>
+          );
+        }
+        return (
+          <p key={i} className={`${className} ${spacing}`}>
+            {lines.map((line, j, arr) => (
+              <span key={j}>{line}{j < arr.length - 1 && <br/>}</span>
+            ))}
+          </p>
+        );
+      })}
     </>
   );
 }
@@ -527,9 +595,9 @@ function ShortTermModal({ onClose, cuentas, plan }:
 // Score/label/action are derived from the real risk probability (see
 // creditReadiness() above) so they can't contradict the risk badge. The
 // income/expense chart stays MOCK: no monthly income-history endpoint yet.
-function CreditReadinessModal({ onClose, riesgo, plan }:
-  { onClose: () => void; riesgo: Riesgo; plan: Plan | null }) {
-  const cr = creditReadiness(riesgo, plan);
+function CreditReadinessModal({ onClose, riesgo, plan, goals }:
+  { onClose: () => void; riesgo: Riesgo; plan: Plan | null; goals: string[] }) {
+  const cr = creditReadiness(riesgo, plan, goals);
   return (
     <FloatingModal onClose={onClose}>
       <div className="px-6 pt-6 pb-6">
@@ -1126,67 +1194,51 @@ function DepositScreen({ onBack, risk, accounts, onMutated }:
 }
 
 // ─── Home screen ──────────────────────────────────────────────────────────────
-function HomeScreen({ risk, usuario, cuentas, riesgo, plan, revisionTexto, accounts, onNav }: {
+function HomeScreen({ risk, usuario, cuentas, riesgo, plan, goals, accounts, onNav }: {
   risk: RiskState; usuario: Usuario; cuentas: Cuentas; riesgo: Riesgo; plan: Plan | null;
-  revisionTexto: string | null; accounts: Account[]; onNav: (s: Screen) => void;
+  goals: string[]; accounts: Account[]; onNav: (s: Screen) => void;
 }) {
   const cfg = RISK_STYLE[risk];
-  // Real paragraphs from CapiFrog's own explanation (GET /revision) — a
-  // handful of substantial slides instead of many one-line fragments.
-  const slides = revisionTexto ? splitParagraphs(revisionTexto) : [fallbackSummary(risk, riesgo, plan)];
-  const [insightIdx, setInsightIdx] = useState(0);
-  const [fade, setFade]             = useState(true);
   const [showCR, setShowCR]         = useState(false);
   const [openAccount, setOpenAccount] = useState<AccountId | null>(null);
-  const cr = creditReadiness(riesgo, plan);
-
-  useEffect(() => {
-    setInsightIdx(0);
-  }, [risk, revisionTexto]);
-
-  useEffect(() => {
-    if (slides.length < 2) return;
-    const t = setInterval(() => {
-      setFade(false);
-      setTimeout(() => {
-        setInsightIdx((i) => (i + 1) % slides.length);
-        setFade(true);
-      }, 250);
-    }, 6000);
-    return () => clearInterval(t);
-  }, [slides.length]);
+  const cr = creditReadiness(riesgo, plan, goals);
+  const checkingAcc = accounts.find((a) => a.id === "checking");
+  const otherAccounts = accounts.filter((a) => a.id !== "checking");
 
   const safeToSave = plan ? Math.max(Math.round(plan.excedente_mensual), 0) : 0;
 
   // Shared sub-sections as render helpers so both layouts share the same markup
 
+  // One static bubble with the most important facts — no rotating slides.
   const Hero = (
     <div className="flex items-start gap-3 mb-5">
       <img src={cfg.frog} alt="CapiFrog" className="w-16 h-16 lg:w-20 lg:h-20 object-contain shrink-0"/>
       <div className="flex-1 pt-1">
         <SpeechBubble>
-          <div style={{ minHeight: "3rem", opacity: fade ? 1 : 0, transition:"opacity 0.25s ease" }} className="mb-2">
-            <FormattedText text={slides[insightIdx % slides.length]}
-              className="text-sm lg:text-base text-[var(--color-foreground)] leading-relaxed" />
-          </div>
+          <FormattedText text={keyInsights(risk, riesgo, plan)}
+            className="text-sm lg:text-base text-[var(--color-foreground)] leading-relaxed mb-2" />
           <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full ${cfg.badge.bg}`}>
             <div className={`w-1.5 h-1.5 rounded-full ${cfg.badge.dot}`}/>
             <span className={`text-[11px] font-semibold ${cfg.badge.text}`}>{cfg.label}</span>
           </div>
-          {slides.length > 1 && (
-            <div className="flex gap-1 mt-2">
-              {slides.map((_, i) => (
-                <div key={i} className="rounded-full transition-all" style={{
-                  width: i === insightIdx ? 10 : 5, height: 5,
-                  backgroundColor: i === insightIdx ? "var(--color-primary)" : "var(--color-border)",
-                }}/>
-              ))}
-            </div>
-          )}
         </SpeechBubble>
       </div>
     </div>
   );
+
+  // Checking sits at the very top — it's the account people check most.
+  const CheckingCard = checkingAcc ? (
+    <button onClick={() => setOpenAccount("checking")}
+      className="w-full text-left mb-5 rounded-2xl border border-[var(--color-border)] bg-white px-4 py-3.5 flex items-center justify-between hover:border-[var(--color-primary)] transition-colors">
+      <div>
+        <p className="text-[10px] font-semibold uppercase text-[var(--color-muted-foreground)] mb-1" style={{ letterSpacing:"0.12em" }}>Checking</p>
+        <p style={{ fontFamily:"var(--font-serif)" }} className="text-2xl text-[var(--color-foreground)]">
+          ${checkingAcc.value.toLocaleString("en-US",{minimumFractionDigits:checkingAcc.value%1!==0?2:0})}
+        </p>
+      </div>
+      <Chevron/>
+    </button>
+  ) : null;
 
   const AskMe = (
     <button onClick={() => onNav("chat")} className="flex items-center gap-2 mb-5 group">
@@ -1251,34 +1303,34 @@ function HomeScreen({ risk, usuario, cuentas, riesgo, plan, revisionTexto, accou
     </div>
   );
 
-  const FinancialReview = plan && plan.excedente_mensual > 0 ? (
+  // Shows only the single best next move — a goal-aware pick from topBucket()
+  // — instead of ranking all three savings buckets.
+  const SafeToSave = plan && plan.excedente_mensual > 0 ? (
     <>
       <HairlineRule/>
       <div className="py-5">
-        <p className="text-[10px] font-semibold uppercase text-[var(--color-muted-foreground)] mb-3" style={{ letterSpacing:"0.12em" }}>Financial Review</p>
+        <p className="text-[10px] font-semibold uppercase text-[var(--color-muted-foreground)] mb-3" style={{ letterSpacing:"0.12em" }}>Safe to Save</p>
         <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[#2a9d8f] mb-3">${safeToSave}</p>
-        <div className="space-y-2">
-          {[
-            { id:"fondo_lluvia",      label:"Rainy Day Fund",     amount: plan.aportaciones.fondo_lluvia },
-            { id:"alto_rendimiento",  label:"High-Yield Savings", amount: plan.aportaciones.alto_rendimiento },
-            { id:"corto_plazo",       label:"Short-term Savings", amount: plan.aportaciones.corto_plazo },
-          ].sort((a, b) => b.amount - a.amount).map((opt, i) => (
-            <div key={opt.id} className={`flex items-center justify-between rounded-xl px-4 py-3 border ${i===0?"border-[#2a9d8f] bg-[#e6f7f5]":"border-[var(--color-border)] bg-[var(--color-muted)]"}`}>
-              <p className={`text-sm font-medium ${i===0?"text-[#2a9d8f]":"text-[var(--color-foreground)]"}`}>{opt.label}</p>
+        {(() => {
+          const top = topBucket(plan, goals);
+          return (
+            <div className="flex items-center justify-between rounded-xl px-4 py-3 border border-[#2a9d8f] bg-[#e6f7f5]">
+              <p className="text-sm font-medium text-[#2a9d8f]">{top.label}</p>
               <div className="flex items-center gap-2">
-                <p className={`text-sm ${i===0?"text-[#2a9d8f]":"text-[var(--color-foreground)]"}`}>${Math.round(opt.amount)}</p>
-                {i===0 && <span className="text-[10px] font-bold text-[#2a9d8f] bg-white px-2 py-0.5 rounded-full border border-[#2a9d8f]">Recommended</span>}
+                <p className="text-sm text-[#2a9d8f]">${Math.round(top.amount)}</p>
+                <span className="text-[10px] font-bold text-[#2a9d8f] bg-white px-2 py-0.5 rounded-full border border-[#2a9d8f]">Recommended</span>
               </div>
             </div>
-          ))}
-        </div>
+          );
+        })()}
       </div>
     </>
   ) : null;
 
+  // Checking has its own card above — this list is the remaining accounts.
   const AccountsList = (
     <div className="py-4">
-      {accounts.map((acc, i) => (
+      {otherAccounts.map((acc, i) => (
         <div key={acc.id}>
           <button className="w-full flex items-center justify-between py-3.5 text-left"
             onClick={() => setOpenAccount(acc.id)}>
@@ -1291,7 +1343,7 @@ function HomeScreen({ risk, usuario, cuentas, riesgo, plan, revisionTexto, accou
               <Chevron/>
             </div>
           </button>
-          {i < accounts.length - 1 && <HairlineRule/>}
+          {i < otherAccounts.length - 1 && <HairlineRule/>}
         </div>
       ))}
     </div>
@@ -1303,9 +1355,10 @@ function HomeScreen({ risk, usuario, cuentas, riesgo, plan, revisionTexto, accou
       <div className="lg:hidden px-6 pb-12 pt-5">
         {Hero}
         {AskMe}
+        {CheckingCard}
         {CRPreview}
         {FindHelp}
-        {FinancialReview}
+        {SafeToSave}
         <HairlineRule/>
         {AccountsList}
         <HairlineRule/>
@@ -1315,16 +1368,17 @@ function HomeScreen({ risk, usuario, cuentas, riesgo, plan, revisionTexto, accou
       {/* ── Desktop layout (two columns) ── */}
       <div className="hidden lg:grid lg:grid-cols-[1fr_1fr] lg:gap-0 lg:items-start pb-16 pt-8 px-10">
 
-        {/* Left column: hero + ask me + find help + actions */}
+        {/* Left column: hero + ask me + checking + find help + actions */}
         <div className="pr-10 border-r border-[var(--color-border)] sticky top-[73px] self-start">
           {Hero}
           {AskMe}
+          {CheckingCard}
           {FindHelp}
           <HairlineRule className="mb-5"/>
           {Actions}
         </div>
 
-        {/* Right column: credit readiness + financial review + accounts */}
+        {/* Right column: credit readiness + safe to save + accounts */}
         <div className="pl-10">
           {/* CR preview without top hairline on desktop (header already provides separation) */}
           <div className="mb-5">
@@ -1348,14 +1402,14 @@ function HomeScreen({ risk, usuario, cuentas, riesgo, plan, revisionTexto, accou
             <HairlineRule/>
           </div>
 
-          {FinancialReview}
+          {SafeToSave}
           <HairlineRule/>
           {AccountsList}
         </div>
       </div>
 
       {/* Floating modals */}
-      {showCR                       && <CreditReadinessModal onClose={() => setShowCR(false)} riesgo={riesgo} plan={plan}/>}
+      {showCR                       && <CreditReadinessModal onClose={() => setShowCR(false)} riesgo={riesgo} plan={plan} goals={goals}/>}
       {openAccount === "checking"   && <CheckingModal   onClose={() => setOpenAccount(null)} cuentas={cuentas} usuario={usuario} plan={plan}/>}
       {openAccount === "emergency"  && <EmergencyModal  onClose={() => setOpenAccount(null)} cuentas={cuentas} usuario={usuario} plan={plan}/>}
       {openAccount === "bills"      && <BillsModal      onClose={() => setOpenAccount(null)} cuentas={cuentas}/>}
@@ -1373,14 +1427,15 @@ export default function App() {
   const [cuentas, setCuentas] = useState<Cuentas | null>(null);
   const [riesgo, setRiesgo]   = useState<Riesgo | null>(null);
   const [plan, setPlan]       = useState<Plan | null>(null);
-  const [revisionTexto, setRevisionTexto] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState<string | null>(null);
+  const [goals, setGoals]     = useState<string[]>(() => readStoredProfile()?.goals.goals ?? []);
+  const [showProfileFlow, setShowProfileFlow] = useState(false);
 
   // Pull a fresh snapshot from the backend. Used on initial load and again
   // after any action that mutates state server-side (transfer, deposit,
-  // preset switch) — backend/main.py bundles usuario+cuentas+riesgo together,
-  // but the derived savings plan (and CapiFrog's narration of it) comes from
+  // preset switch, profile edit) — backend/main.py bundles
+  // usuario+cuentas+riesgo together, but the derived savings plan comes from
   // a separate call.
   async function refrescar() {
     const u = await getUsuario(); // GET /usuario
@@ -1390,17 +1445,38 @@ export default function App() {
     try {
       const r = await getRevision(); // GET /revision — backend/plan.py plan_ahorro()
       setPlan(r.plan);
-      setRevisionTexto(r.texto ?? null);
     } catch {
       setPlan(null);
-      setRevisionTexto(null);
     }
+  }
+
+  // Pushes the one onboarding answer with a real backend counterpart
+  // (income predictability → estabilidad_ingreso) via PATCH /usuario.
+  async function applyProfile(answers: ProfileAnswers) {
+    try {
+      await editarUsuario({ estabilidad_ingreso: estimateEstabilidad(answers.predictability) });
+    } catch {
+      // best-effort — a stale estabilidad_ingreso just means predictions
+      // don't reflect the latest answer yet; not worth blocking the UI on.
+    }
+  }
+
+  async function handleProfileComplete(answers: ProfileAnswers) {
+    storeProfile(answers);
+    setGoals(answers.goals.goals);
+    setShowProfileFlow(false);
+    setLoading(true);
+    await applyProfile(answers);
+    await refrescar();
+    setLoading(false);
   }
 
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
+        const stored = readStoredProfile();
+        if (stored) await applyProfile(stored);
         await refrescar();
         if (alive) setError(null);
       } catch {
@@ -1467,14 +1543,23 @@ export default function App() {
           </div>
           <p className="text-xs text-[var(--color-muted-foreground)] font-medium">{usuario.nombre}</p>
         </div>
-        <img src={capitalOneLogo} alt="Capital One" className="h-6 object-contain cursor-pointer select-none"
-          onClick={handleLogoTap}/>
+        <div className="flex items-center gap-3">
+          <img src={capitalOneLogo} alt="Capital One" className="h-6 object-contain cursor-pointer select-none"
+            onClick={handleLogoTap}/>
+          <button onClick={() => setShowProfileFlow(true)} aria-label="Edit your profile"
+            className="w-7 h-7 rounded-full bg-[var(--color-secondary)] border border-[var(--color-border)] flex items-center justify-center text-[var(--color-primary)] hover:bg-[var(--color-primary)] hover:text-white transition-colors">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <circle cx="7" cy="4.5" r="2.5" stroke="currentColor" strokeWidth="1.2"/>
+              <path d="M1.5 13c0-2.5 2.5-4 5.5-4s5.5 1.5 5.5 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+            </svg>
+          </button>
+        </div>
       </header>
 
       {/* Home screen uses its own responsive grid; secondary screens stay centered narrow */}
       {screen === "home" ? (
         <main className="max-w-md lg:max-w-4xl mx-auto">
-          <HomeScreen risk={risk} usuario={usuario} cuentas={cuentas} riesgo={riesgo} plan={plan} revisionTexto={revisionTexto} accounts={accounts} onNav={setScreen}/>
+          <HomeScreen risk={risk} usuario={usuario} cuentas={cuentas} riesgo={riesgo} plan={plan} goals={goals} accounts={accounts} onNav={setScreen}/>
         </main>
       ) : (
         <main className="max-w-md lg:max-w-xl mx-auto lg:px-0">
@@ -1484,6 +1569,10 @@ export default function App() {
           {screen === "transfer" && <TransferScreen onBack={() => setScreen("home")} risk={risk} accounts={accounts} onMutated={refrescar}/>}
           {screen === "deposit"  && <DepositScreen  onBack={() => setScreen("home")} risk={risk} accounts={accounts} onMutated={refrescar}/>}
         </main>
+      )}
+
+      {showProfileFlow && (
+        <ProfileUpdateFlow onCancel={() => setShowProfileFlow(false)} onComplete={handleProfileComplete}/>
       )}
     </div>
   );
