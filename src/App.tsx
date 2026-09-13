@@ -3,92 +3,245 @@ import capitalOneLogo from "@/imports/image-3.png";
 import frogStable     from "@/imports/image-5.png";
 import frogMedium     from "@/imports/MONEY_GETTING_TIGHT_.jpeg";
 import frogHigh       from "@/imports/SAVINGS.jpeg";
+import {
+  getUsuario, getRevision, getMonitoreo,
+  editarCuentas, aplicarPreset,
+  simular, transferirPreview, transferir, chatear,
+} from "./api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-type RiskState = "stable" | "medium" | "high";
-type Screen    = "home" | "transfer" | "deposit" | "simulate" | "chat" | "help";
-type AccountId = "checking" | "emergency" | "bills" | "hysa" | "shortterm";
+type RiskState  = "stable" | "medium" | "high";
+type Screen     = "home" | "transfer" | "deposit" | "simulate" | "chat" | "help";
+type AccountId  = "checking" | "emergency" | "bills" | "hysa" | "shortterm";
+type NivelRiesgo = "bajo" | "medio" | "alto";
 
-// ─── Risk config ──────────────────────────────────────────────────────────────
-const RISK_INSIGHTS: Record<RiskState, string[]> = {
-  stable: [
-    "You're on track this week.",
-    "$80 is safe to save.",
-    "Your routine bills are covered.",
-    "High-Yield Savings is earning for you.",
-  ],
-  medium: [
-    "Things may get tight soon.",
-    "Rent is due before your next paycheck.",
-    "This week is tighter than usual.",
-    "Consider pausing unused subscriptions.",
-  ],
-  high: [
-    "Your finances need attention.",
-    "Prioritize rent and essential bills.",
-    "Check your emergency fund options.",
-    "Reach out for support if needed.",
-  ],
+// Shapes returned by the FastAPI backend (backend/main.py). Loosely typed on
+// purpose — the backend is still evolving and we don't want TS fighting it.
+interface Riesgo {
+  probabilidad: number;
+  nivel: NivelRiesgo;
+  drivers: string[];
+  prob_quiebra_6m: number;
+  meses_colchon: number;
+}
+interface Usuario {
+  nombre: string;
+  edad: number;
+  ingreso_mensual: number;
+  gastos_esenciales: number;
+  gastos_discrecionales: number;
+  pago_deuda_mensual: number;
+  deuda_total: number;
+  ahorro_liquido: number;
+  estabilidad_ingreso: number;
+  dependientes: number;
+  seguro_medico: boolean;
+  historial_gastos: number[];
+}
+interface Cuentas {
+  balance: number;
+  fondo_lluvia: number;
+  gastos_fijos: number;
+  alto_rendimiento: number;
+  corto_plazo: number;
+}
+interface Plan {
+  excedente_mensual: number;
+  recorte_sugerido: number;
+  meta_fondo_lluvia: number;
+  faltante_fondo: number;
+  meses_para_meta: number | null;
+  aportaciones: { fondo_lluvia: number; alto_rendimiento: number; corto_plazo: number };
+  interes_12m_hys: number;
+}
+interface Monitoreo {
+  nivel: NivelRiesgo;
+  probabilidad: number;
+  drivers: string[];
+  meses_colchon: number;
+  acciones: string[];
+  escenarios?: Record<string, boolean>;
+  contacto?: { nombre: string; canal: string; telefono: string };
+  programas?: { nombre: string; via: string }[];
+  texto?: string | null;
+  mensaje_contacto?: string;
+}
+interface SimResultado {
+  escenario: string;
+  ahorro_resultante: number;
+  meses_colchon: number;
+  riesgo: NivelRiesgo;
+  prob_riesgo: number;
+  prob_quiebra_6m: number;
+  descubierto: boolean;
+}
+interface Simulacion {
+  monto: number;
+  resultados: SimResultado[];
+  costo_oportunidad_12m: number;
+  texto: string;
+}
+
+// ─── Backend ↔ frontend mappings ───────────────────────────────────────────
+// backend/estado.py risk labels ("bajo"/"medio"/"alto") vs the frontend's
+// stable/medium/high palette.
+const NIVEL_TO_RISK: Record<NivelRiesgo, RiskState> = { bajo: "stable", medio: "medium", alto: "high" };
+const NIVEL_LABEL_EN: Record<NivelRiesgo, string> = { bajo: "Low", medio: "Medium", alto: "High" };
+
+// Frontend account ids vs backend/mock_user.py CUENTAS keys.
+const ACCOUNT_BACKEND_KEY: Record<AccountId, keyof Cuentas> = {
+  checking:  "balance",
+  emergency: "fondo_lluvia",
+  bills:     "gastos_fijos",
+  hysa:      "alto_rendimiento",
+  shortterm: "corto_plazo",
 };
 
-const RISK = {
+// backend/features.py ORDEN — the risk drivers a user can be told about.
+const DRIVER_LABELS: Record<string, string> = {
+  tasa_ahorro:          "a low savings rate",
+  meses_colchon:        "a thin cash cushion",
+  dti:                  "high monthly debt payments",
+  volatilidad_gasto:    "unpredictable spending",
+  estabilidad_ingreso:  "unstable income",
+  carga_dependientes:   "supporting dependents",
+  exposicion_salud:     "health cost exposure",
+  ratio_discrecional:   "high discretionary spending",
+};
+
+// backend/plan.py monitorear() escenarios
+const ESCENARIO_INFO: Record<string, { label: string; trueImpact: string; falseImpact: string }> = {
+  pierde_un_pago:        { label: "Miss a paycheck",            trueImpact: "Your buffer likely runs out before the next one.", falseImpact: "Your buffer covers a missed paycheck." },
+  pierde_empleo_3m:      { label: "Lose income for 3 months",   trueImpact: "Savings would not last 3 months.",                  falseImpact: "Savings could cover 3 months." },
+  emergencia_medica_20k: { label: "$20,000 medical emergency",  trueImpact: "Liquid savings would not cover it.",                falseImpact: "Liquid savings could absorb it." },
+};
+
+// backend/plan.py monitorear() acciones
+const ACCION_STEPS: Record<string, string> = {
+  notificacion:               "Review this alert and your recent spending",
+  alerta:                     "Avoid new discretionary spending this week",
+  ofrecer_contacto_confianza: "Consider notifying your trusted contact",
+  mostrar_programas:          "Look into the assistance programs below",
+};
+
+const VEREDICTO_LABELS: Record<string, string> = {
+  adecuado:         "Looks good",
+  demasiado:        "Larger than usual for this account",
+  muy_poco:         "Smaller than your usual transfer",
+  fondo_incompleto: "Emergency fund still building — consider that first",
+};
+
+// Demo preset cycle — mirrors backend/mock_user.py PRESETS, exposed via
+// POST /preset/{nombre}. Tap the Capital One logo 5× to cycle through them.
+const PRESET_CYCLE = ["sano", "ajustado", "critico"] as const;
+
+// ─── Static per-tier styling (frog art + badge colors only — numbers below
+// are always real, fetched from the backend) ───────────────────────────────
+const RISK_STYLE: Record<RiskState, {
+  frog: string; label: string;
+  badge: { dot: string; text: string; bg: string };
+}> = {
   stable: {
-    frog: frogStable,
-    label: "Stable",
+    frog: frogStable, label: "Stable",
     badge: { dot: "bg-[#2a9d8f]", text: "text-[#2a9d8f]", bg: "bg-[#e6f7f5]" },
-    safeToSave: 80,
-    saveTo: "High-Yield Savings",
-    cushionWeeks: 6.2,
   },
   medium: {
-    frog: frogMedium,
-    label: "Medium Risk",
-    badge: { dot: "bg-[#c4834a]", text: "text-[#c4834a]", bg: "bg-[#fef6ee]" },
-    safeToSave: 0,
-    saveTo: "Emergency Fund",
-    cushionWeeks: 1.8,
+    frog: frogMedium, label: "Medium Risk",
+    badge: { dot: "bg-[#c4834a]", text: "text-[#c4834a]", bg: "bg-[var(--color-warning-bg)]" },
   },
   high: {
-    frog: frogHigh,
-    label: "High Risk",
-    badge: { dot: "bg-[#c0392b]", text: "text-[#c0392b]", bg: "bg-[#fdf0ef]" },
-    safeToSave: 0,
-    saveTo: null,
-    cushionWeeks: 0.4,
+    frog: frogHigh, label: "High Risk",
+    badge: { dot: "bg-[#c0392b]", text: "text-[#c0392b]", bg: "bg-[var(--color-danger-bg)]" },
   },
 };
 
-// ─── Credit Readiness data ────────────────────────────────────────────────────
+// ─── Credit Readiness demo data ────────────────────────────────────────────
+// MOCK: the backend has no credit-score model or monthly income/expense
+// history endpoint yet (usuario.historial_gastos is only 6 points of total
+// spending, no income breakdown) — nothing real to wire here yet.
 const MONTHS  = ["J","F","M","A","M","J","J","A","S","O","N","D"];
 const MONTHLY_INCOME   = [2100,1400,2800,1600,3200,2400,1200,2700,1900,3100,2200,2600];
 const MONTHLY_EXPENSES = [1780,1750,1820,1780,1860,1830,1700,1840,1760,1890,1810,1870];
 const AVG_INCOME   = Math.round(MONTHLY_INCOME.reduce((a,b)=>a+b,0)/12);
 const AVG_EXPENSES = Math.round(MONTHLY_EXPENSES.reduce((a,b)=>a+b,0)/12);
 const AVG_REMAINING = AVG_INCOME - AVG_EXPENSES;
-const CR_SCORE = 76;
-const CR_LABEL = "Building Strongly";
-const CR_ACTION = "Add $300 to your Rainy Day Fund.";
 
-// ─── Accounts ─────────────────────────────────────────────────────────────────
-const ACCOUNTS: { id: AccountId; label: string; value: number; note?: string }[] = [
-  { id: "checking",  label: "Checking",           value: 2847.60 },
-  { id: "emergency", label: "Emergency Fund",      value: 1200,  note: "$1,800 to goal" },
-  { id: "bills",     label: "Routine Bills",       value: 1488,  note: "2 unpaid" },
-  { id: "hysa",      label: "High-Yield Savings",  value: 3400 },
-  { id: "shortterm", label: "Short-term Savings",  value: 620 },
+// ─── Account display metadata (values come from the backend at runtime) ───
+const ACCOUNT_META: { id: AccountId; label: string }[] = [
+  { id: "checking",  label: "Checking" },
+  { id: "emergency", label: "Emergency Fund" },
+  { id: "bills",     label: "Routine Bills" },
+  { id: "hysa",      label: "High-Yield Savings" },
+  { id: "shortterm", label: "Short-term Savings" },
 ];
 
-// ─── Chat data ────────────────────────────────────────────────────────────────
-const CHAT_RESPONSES: Record<string, string> = {
-  "why am i stable":            "Bills covered before payday, 6+ weeks of cushion, savings growing.",
-  "why medium risk":            "Rent and electric are due before Sep 20, leaving a thin buffer.",
-  "why high risk":              "Balance minus upcoming bills leaves less than a week of cushion.",
-  "why save $80":               "After bills and a safety buffer, $80 remains without stress.",
-  "where should i save":        "High-Yield Savings at 4.6% APY when stable. Emergency Fund when stressed.",
-  "what is rainy day fund":     "Your buffer for unexpected costs. Goal: ~$3,000 (1 month of expenses).",
-  "how long will my money last":"At current spending, about 6.2 weeks of cushion.",
-  "default":                    "Try: 'Why am I stable?' or 'Where should I save?'",
-};
+type Account = { id: AccountId; label: string; value: number; note?: string };
+
+function buildAccounts(cuentas: Cuentas, plan: Plan | null): Account[] {
+  const remaining = plan ? plan.meta_fondo_lluvia - cuentas.fondo_lluvia : null;
+  return ACCOUNT_META.map((meta) => {
+    const value = cuentas[ACCOUNT_BACKEND_KEY[meta.id]];
+    let note: string | undefined;
+    if (meta.id === "emergency" && remaining != null) {
+      note = remaining > 1 ? `$${Math.round(remaining).toLocaleString()} to goal` : "Goal reached";
+    }
+    return { id: meta.id, label: meta.label, value, note };
+  });
+}
+
+// A one-line fallback for the Home hero while the real Gemini narration
+// (fetched separately via GET /revision) hasn't loaded yet.
+function fallbackSummary(risk: RiskState, riesgo: Riesgo, plan: Plan | null): string {
+  const cushion = riesgo.meses_colchon.toFixed(1);
+  const driver  = riesgo.drivers[0] ? (DRIVER_LABELS[riesgo.drivers[0]] ?? riesgo.drivers[0]) : null;
+  const money   = plan && plan.excedente_mensual > 0
+    ? `$${Math.round(plan.excedente_mensual)} is safe to save this month.`
+    : "Your budget is tight this month.";
+  if (risk === "stable") return `You're on track, with about ${cushion} months of cushion. ${money}`;
+  return `You're at ${RISK_STYLE[risk].label.toLowerCase()}, with about ${cushion} months of cushion${driver ? ` — mainly due to ${driver}` : ""}. ${money}`;
+}
+
+// Derives a 0-100 "credit readiness" style score directly from the trained
+// risk model's probability, so it can never contradict the risk badge the
+// way a hardcoded score could. There's no separate credit-score model on
+// the backend — this is the same number the risk badge is built from.
+function creditReadiness(riesgo: Riesgo, plan: Plan | null) {
+  const score = Math.max(0, Math.min(100, Math.round((1 - riesgo.probabilidad) * 100)));
+  const label = score >= 70 ? "Building Strongly" : score >= 40 ? "Needs Attention" : "At Risk";
+  const trend = score >= 40 ? "↑" : "↓";
+  const buckets = plan ? [
+    { label: "Rainy Day Fund",     amount: plan.aportaciones.fondo_lluvia },
+    { label: "High-Yield Savings", amount: plan.aportaciones.alto_rendimiento },
+    { label: "Short-term Savings", amount: plan.aportaciones.corto_plazo },
+  ].sort((a, b) => b.amount - a.amount) : [];
+  const top = buckets[0];
+  const action = top && top.amount > 0
+    ? `Add $${Math.round(top.amount)} to your ${top.label}.`
+    : "Keep an eye on your monthly spending.";
+  return { score, label, trend, action };
+}
+
+// Renders Gemini-authored text (backend/gemini_texto.py) with real paragraph
+// and line breaks instead of one squished block — the SISTEM prompt asks for
+// blank-line-separated paragraphs and no markdown, so this is plain-text only.
+function splitParagraphs(text: string): string[] {
+  return text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+}
+
+function FormattedText({ text, className = "" }: { text: string; className?: string }) {
+  const paragraphs = splitParagraphs(text);
+  return (
+    <>
+      {paragraphs.map((p, i) => (
+        <p key={i} className={`${className} ${i < paragraphs.length - 1 ? "mb-2" : ""}`}>
+          {p.split("\n").map((line, j, arr) => (
+            <span key={j}>{line}{j < arr.length - 1 && <br/>}</span>
+          ))}
+        </p>
+      ))}
+    </>
+  );
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function HairlineRule({ className = "" }: { className?: string }) {
@@ -214,46 +367,62 @@ function MiniChart() {
 }
 
 // ─── Account modals ───────────────────────────────────────────────────────────
-function CheckingModal({ onClose }: { onClose: () => void }) {
+function CheckingModal({ onClose, cuentas, usuario, plan }:
+  { onClose: () => void; cuentas: Cuentas; usuario: Usuario; plan: Plan | null }) {
+  const monthlyIncome   = usuario.ingreso_mensual;
+  const monthlySpending = usuario.gastos_esenciales + usuario.gastos_discrecionales;
+  const safe = plan ? Math.max(Math.round(plan.excedente_mensual), 0) : null;
   return (
     <FloatingModal onClose={onClose}>
       <div className="px-6 pt-6 pb-6">
         <ModalHeader label="Checking" onClose={onClose} />
-        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-4">$2,847.60</p>
+        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-4">
+          ${cuentas.balance.toLocaleString("en-US",{minimumFractionDigits:2})}
+        </p>
         <HairlineRule className="mb-1" />
-        <StatRow label="Avg monthly income"   value={`$${AVG_INCOME.toLocaleString()}`} />
+        <StatRow label="Monthly income"   value={`$${Math.round(monthlyIncome).toLocaleString()}`} />
         <HairlineRule />
-        <StatRow label="Avg monthly spending" value={`$${AVG_EXPENSES.toLocaleString()}`} />
+        <StatRow label="Monthly spending" value={`$${Math.round(monthlySpending).toLocaleString()}`} />
         <HairlineRule />
-        <StatRow label="Safe to use"          value="$80"  accent />
+        <StatRow label="Safe to use"      value={safe != null ? `$${safe}` : "—"} accent />
       </div>
     </FloatingModal>
   );
 }
 
-function EmergencyModal({ onClose }: { onClose: () => void }) {
-  const pct = Math.round((1200/3000)*100);
+function EmergencyModal({ onClose, cuentas, usuario, plan }:
+  { onClose: () => void; cuentas: Cuentas; usuario: Usuario; plan: Plan | null }) {
+  const goal = plan?.meta_fondo_lluvia ?? cuentas.fondo_lluvia;
+  const pct  = goal > 0 ? Math.min(100, Math.round((cuentas.fondo_lluvia / goal) * 100)) : 100;
+  const weeksCovered = usuario.gastos_esenciales > 0
+    ? (cuentas.fondo_lluvia / usuario.gastos_esenciales) * 4.345
+    : 0;
+  const nextContribution = plan ? Math.round(plan.aportaciones.fondo_lluvia) : null;
   return (
     <FloatingModal onClose={onClose}>
       <div className="px-6 pt-6 pb-6">
         <ModalHeader label="Emergency Fund" onClose={onClose} />
-        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-1">$1,200</p>
-        <p className="text-xs text-[var(--color-muted-foreground)] mb-4">of $3,000 goal</p>
+        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-1">
+          ${Math.round(cuentas.fondo_lluvia).toLocaleString()}
+        </p>
+        <p className="text-xs text-[var(--color-muted-foreground)] mb-4">of ${Math.round(goal).toLocaleString()} goal</p>
         <div className="h-1.5 rounded-full bg-[var(--color-muted)] overflow-hidden mb-4">
           <div className="h-full rounded-full bg-[#2a9d8f]" style={{ width:`${pct}%` }}/>
         </div>
         <HairlineRule className="mb-1" />
-        <StatRow label="Progress"         value={`${pct}%`} />
+        <StatRow label="Progress"          value={`${pct}%`} />
         <HairlineRule />
-        <StatRow label="Covers essentials" value="~2.4 weeks" />
+        <StatRow label="Covers essentials" value={`~${weeksCovered.toFixed(1)} weeks`} />
         <HairlineRule />
-        <StatRow label="Next contribution" value="$80" accent />
+        <StatRow label="Next contribution" value={nextContribution != null ? `$${nextContribution}` : "—"} accent />
       </div>
     </FloatingModal>
   );
 }
 
-function BillsModal({ onClose }: { onClose: () => void }) {
+function BillsModal({ onClose, cuentas }: { onClose: () => void; cuentas: Cuentas }) {
+  // MOCK: the backend tracks a single "gastos_fijos" balance, not individual
+  // bills with due dates — the line items below are illustrative only.
   const bills = [
     { name:"Rent",         amount:1200, due:"Sep 15", paid:false },
     { name:"Electric",     amount:78,   due:"Sep 18", paid:false },
@@ -264,7 +433,9 @@ function BillsModal({ onClose }: { onClose: () => void }) {
       <div className="px-6 pt-6 pb-6">
         <ModalHeader label="Routine Bills" onClose={onClose} />
         <div className="flex items-baseline gap-2 mb-4">
-          <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)]">$1,488</p>
+          <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)]">
+            ${Math.round(cuentas.gastos_fijos).toLocaleString()}
+          </p>
           <p className="text-xs text-[var(--color-muted-foreground)]">this month</p>
         </div>
         <div className="space-y-0">
@@ -292,18 +463,25 @@ function BillsModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function HYSAModal({ onClose, risk }: { onClose: () => void; risk: RiskState }) {
+// backend/mock_user.py RENDIMIENTO_HYS = 0.09 — not exposed over the API yet,
+// mirrored here so the displayed APY matches what the backend actually uses.
+const RENDIMIENTO_HYS_DISPLAY = 0.09;
+
+function HYSAModal({ onClose, cuentas, plan, risk }:
+  { onClose: () => void; cuentas: Cuentas; plan: Plan | null; risk: RiskState }) {
   const recommended = risk === "stable";
-  const yearly = Math.round(3400 * 0.046);
+  const yearly = plan ? Math.round(plan.interes_12m_hys) : Math.round(cuentas.alto_rendimiento * RENDIMIENTO_HYS_DISPLAY);
   return (
     <FloatingModal onClose={onClose}>
       <div className="px-6 pt-6 pb-6">
         <ModalHeader label="High-Yield Savings" onClose={onClose} />
-        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-4">$3,400</p>
+        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-4">
+          ${Math.round(cuentas.alto_rendimiento).toLocaleString()}
+        </p>
         <HairlineRule className="mb-1" />
-        <StatRow label="APY"                    value="4.6%" />
+        <StatRow label="APY"                  value={`${(RENDIMIENTO_HYS_DISPLAY*100).toFixed(1)}%`} />
         <HairlineRule />
-        <StatRow label="Est. yearly earnings"   value={`$${yearly}`} accent />
+        <StatRow label="Est. yearly earnings" value={`$${yearly}`} accent />
         <HairlineRule />
         <div className="pt-2.5">
           <p className="text-xs text-[var(--color-muted-foreground)]">
@@ -317,30 +495,41 @@ function HYSAModal({ onClose, risk }: { onClose: () => void; risk: RiskState }) 
   );
 }
 
-function ShortTermModal({ onClose }: { onClose: () => void }) {
-  const pct = Math.round((620/1000)*100);
-  const monthsLeft = Math.ceil((1000-620)/80);
+function ShortTermModal({ onClose, cuentas, plan }:
+  { onClose: () => void; cuentas: Cuentas; plan: Plan | null }) {
+  // Goal is a demo placeholder — backend/estado.py has no short-term goal field yet.
+  const goal = 1000;
+  const pct  = Math.min(100, Math.round((cuentas.corto_plazo / goal) * 100));
+  const monthly = plan && plan.excedente_mensual > 0 ? plan.excedente_mensual : 80;
+  const monthsLeft = Math.max(0, Math.ceil((goal - cuentas.corto_plazo) / monthly));
   return (
     <FloatingModal onClose={onClose}>
       <div className="px-6 pt-6 pb-6">
         <ModalHeader label="Short-term Savings" onClose={onClose} />
         <p className="text-[10px] text-[var(--color-muted-foreground)] mb-1 uppercase" style={{ letterSpacing:"0.1em" }}>Vacation Fund</p>
-        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-1">$620</p>
-        <p className="text-xs text-[var(--color-muted-foreground)] mb-4">of $1,000 goal</p>
+        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-1">
+          ${Math.round(cuentas.corto_plazo).toLocaleString()}
+        </p>
+        <p className="text-xs text-[var(--color-muted-foreground)] mb-4">of ${goal.toLocaleString()} goal</p>
         <div className="h-1.5 rounded-full bg-[var(--color-muted)] overflow-hidden mb-4">
           <div className="h-full rounded-full bg-[var(--color-primary)]" style={{ width:`${pct}%` }}/>
         </div>
         <HairlineRule className="mb-1" />
-        <StatRow label="Progress"         value={`${pct}%`} />
+        <StatRow label="Progress"          value={`${pct}%`} />
         <HairlineRule />
-        <StatRow label="Est. time to goal" value={`~${monthsLeft} months`} accent />
+        <StatRow label="Est. time to goal" value={monthsLeft > 0 ? `~${monthsLeft} months` : "Goal reached"} accent />
       </div>
     </FloatingModal>
   );
 }
 
 // ─── Credit Readiness modal ───────────────────────────────────────────────────
-function CreditReadinessModal({ onClose }: { onClose: () => void }) {
+// Score/label/action are derived from the real risk probability (see
+// creditReadiness() above) so they can't contradict the risk badge. The
+// income/expense chart stays MOCK: no monthly income-history endpoint yet.
+function CreditReadinessModal({ onClose, riesgo, plan }:
+  { onClose: () => void; riesgo: Riesgo; plan: Plan | null }) {
+  const cr = creditReadiness(riesgo, plan);
   return (
     <FloatingModal onClose={onClose}>
       <div className="px-6 pt-6 pb-6">
@@ -348,24 +537,24 @@ function CreditReadinessModal({ onClose }: { onClose: () => void }) {
 
         {/* Score */}
         <div className="flex items-baseline gap-2 mb-1">
-          <p style={{ fontFamily:"var(--font-serif)" }} className="text-5xl text-[var(--color-foreground)]">{CR_SCORE}</p>
+          <p style={{ fontFamily:"var(--font-serif)" }} className="text-5xl text-[var(--color-foreground)]">{cr.score}</p>
           <p className="text-sm text-[var(--color-muted-foreground)]">/ 100</p>
         </div>
         <div className="flex items-center gap-1.5 mb-1">
           <div className="w-1.5 h-1.5 rounded-full bg-[#2a9d8f]"/>
-          <p className="text-xs font-semibold text-[#2a9d8f]">{CR_LABEL} ↑</p>
+          <p className="text-xs font-semibold text-[#2a9d8f]">{cr.label} {cr.trend}</p>
         </div>
         <div className="h-0.5 rounded-full bg-[var(--color-muted)] overflow-hidden mt-3 mb-4">
-          <div className="h-full rounded-full bg-[#2a9d8f]" style={{ width:`${CR_SCORE}%` }}/>
+          <div className="h-full rounded-full bg-[#2a9d8f]" style={{ width:`${cr.score}%` }}/>
         </div>
 
-        {/* Legend + chart */}
+        {/* Legend + chart — MOCK: no monthly income-history endpoint yet */}
         <div className="flex items-center gap-4 mb-2">
           <span className="flex items-center gap-1 text-[10px] text-[var(--color-muted-foreground)]">
-            <span className="w-2 h-1.5 rounded-sm inline-block bg-[#2a9d8f] opacity-70"/>Ingresos
+            <span className="w-2 h-1.5 rounded-sm inline-block bg-[#2a9d8f] opacity-70"/>Income
           </span>
           <span className="flex items-center gap-1 text-[10px] text-[var(--color-muted-foreground)]">
-            <span className="w-2 h-1.5 rounded-sm inline-block bg-[#004977] opacity-30"/>Gastos
+            <span className="w-2 h-1.5 rounded-sm inline-block bg-[#004977] opacity-30"/>Expenses
           </span>
         </div>
         <MiniChart />
@@ -387,7 +576,7 @@ function CreditReadinessModal({ onClose }: { onClose: () => void }) {
         {/* Next step */}
         <div className="rounded-2xl bg-[#e6f7f5] px-4 py-3 flex items-center gap-2">
           <span className="text-[#2a9d8f] text-xs">✧</span>
-          <p className="text-xs font-medium text-[#2a9d8f]">{CR_ACTION}</p>
+          <p className="text-xs font-medium text-[#2a9d8f]">{cr.action}</p>
         </div>
       </div>
     </FloatingModal>
@@ -398,28 +587,37 @@ function CreditReadinessModal({ onClose }: { onClose: () => void }) {
 type ChatMsg = { role: "user" | "frog"; text: string };
 
 function ChatScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
-  const cfg = RISK[risk];
+  const cfg = RISK_STYLE[risk];
   const [msgs, setMsgs] = useState<ChatMsg[]>([
     { role:"frog", text:`Hi! Ask me anything about your finances.` },
   ]);
-  const [input, setInput] = useState("");
+  const [input, setInput]   = useState("");
+  const [sending, setSending] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const suggestions = [
     risk === "stable" ? "Why am I stable?" : risk === "medium" ? "Why medium risk?" : "Why high risk?",
-    "Why save $80?",
     "Where should I save?",
     "How long will my money last?",
+    "What if I spend $500?",
   ];
 
-  function send(text: string) {
+  async function send(text: string) {
     const q = text.trim();
-    if (!q) return;
-    const key    = q.toLowerCase().replace(/[?!.]/g, "");
-    const answer = CHAT_RESPONSES[key] ?? CHAT_RESPONSES["default"];
-    setMsgs((m) => [...m, { role:"user", text:q }, { role:"frog", text:answer }]);
+    if (!q || sending) return;
+    setMsgs((m) => [...m, { role:"user", text:q }]);
     setInput("");
-    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior:"smooth" }), 100);
+    setSending(true);
+    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior:"smooth" }), 50);
+    try {
+      const r = await chatear(q); // POST /chat — backend/chat.py
+      setMsgs((m) => [...m, { role:"frog", text: r.texto || "I couldn't find an answer for that." }]);
+    } catch {
+      setMsgs((m) => [...m, { role:"frog", text: "I couldn't reach the server just now — try again in a moment." }]);
+    } finally {
+      setSending(false);
+      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior:"smooth" }), 100);
+    }
   }
 
   return (
@@ -427,7 +625,7 @@ function ChatScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
       <div className="px-6 pt-2 pb-2 border-b border-[var(--color-border)] flex items-center gap-3">
         <BackButton onBack={onBack} />
         <img src={cfg.frog} alt="frog" className="w-8 h-8 object-contain"/>
-        <p className="text-sm font-medium text-[var(--color-foreground)]">Ask CapFrog</p>
+        <p className="text-sm font-medium text-[var(--color-foreground)]">Ask CapiFrog</p>
       </div>
       <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
         {msgs.map((m, i) => (
@@ -437,15 +635,21 @@ function ChatScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
               m.role === "frog"
                 ? "bg-white border border-[var(--color-border)] text-[var(--color-foreground)] rounded-bl-sm"
                 : "bg-[var(--color-primary)] text-white rounded-br-sm"
-            }`}>{m.text}</div>
+            }`}>{m.role === "frog" ? <FormattedText text={m.text}/> : m.text}</div>
           </div>
         ))}
+        {sending && (
+          <div className="flex gap-2">
+            <img src={cfg.frog} alt="frog" className="w-8 h-8 object-contain shrink-0 self-end"/>
+            <div className="px-3.5 py-2.5 rounded-2xl text-sm bg-white border border-[var(--color-border)] text-[var(--color-muted-foreground)] rounded-bl-sm">…</div>
+          </div>
+        )}
         <div ref={bottomRef}/>
       </div>
       <div className="px-5 pb-2 flex gap-2 overflow-x-auto">
         {suggestions.map((s) => (
-          <button key={s} onClick={() => send(s)}
-            className="shrink-0 text-[11px] font-medium bg-[var(--color-secondary)] text-[var(--color-primary)] px-3 py-1.5 rounded-full border border-[var(--color-border)]">
+          <button key={s} onClick={() => send(s)} disabled={sending}
+            className="shrink-0 text-[11px] font-medium bg-[var(--color-secondary)] text-[var(--color-primary)] px-3 py-1.5 rounded-full border border-[var(--color-border)] disabled:opacity-50">
             {s}
           </button>
         ))}
@@ -455,7 +659,7 @@ function ChatScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
           onKeyDown={(e) => e.key === "Enter" && send(input)}
           placeholder="Ask about your finances…"
           className="flex-1 border border-[var(--color-border)] rounded-xl px-4 py-2.5 text-sm bg-white focus:outline-none focus:border-[var(--color-primary)] transition-colors"/>
-        <button onClick={() => send(input)} className="bg-[var(--color-primary)] text-white rounded-xl px-4 py-2.5 text-sm font-medium">Send</button>
+        <button onClick={() => send(input)} disabled={sending} className="bg-[var(--color-primary)] text-white rounded-xl px-4 py-2.5 text-sm font-medium disabled:opacity-60">Send</button>
       </div>
     </div>
   );
@@ -463,34 +667,26 @@ function ChatScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
 
 // ─── Help screen ──────────────────────────────────────────────────────────────
 function HelpScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
-  const cfg = RISK[risk];
+  const cfg = RISK_STYLE[risk];
+  const [monitoreo, setMonitoreo] = useState<Monitoreo | null>(null);
+  const [loading, setLoading]     = useState(true);
   const [trustedSent, setTrustedSent] = useState(false);
   const [showResources, setShowResources] = useState(false);
 
-  const riskReasons: Record<RiskState, string[]> = {
-    stable: [],
-    medium: ["Rent ($1,200) and electric ($78) due before Sep 20 paycheck.", "Gym subscription unused 6+ weeks.", "Emergency fund at 40% of goal."],
-    high:   ["Balance minus bills leaves under $200.", "No income expected for 8+ days.", "Subscriptions consuming $130/mo."],
-  };
-  const scenarios = risk === "high" ? [
-    { label:"Miss a paycheck",   impact:"Bills likely go unpaid — overdraft risk" },
-    { label:"Emergency expense", impact:"Checking hits zero — no safety net" },
-    { label:"Income loss",       impact:"Critical — immediate action required" },
-  ] : [
-    { label:"Miss a paycheck",   impact:"Bills covered but buffer drops to ~$89" },
-    { label:"Emergency expense", impact:"Dips into emergency fund" },
-    { label:"Extra spending",    impact:"Risk level could move to High" },
-  ];
-  const steps = risk === "high" ? [
-    "Contact landlord before rent is due",
-    "Pause all non-essential subscriptions",
-    "Move available cash to Emergency Fund",
-    "Review Capital One hardship options",
-  ] : [
-    "Skip non-essential purchases this week",
-    "Cancel or pause unused subscriptions",
-    "Hold transfers out of checking",
-  ];
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    getMonitoreo() // GET /monitoreo — backend/plan.py monitorear()
+      .then((m) => { if (alive) setMonitoreo(m); })
+      .catch(() => { if (alive) setMonitoreo(null); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, []);
+
+  const cushion = monitoreo?.meses_colchon ?? 0;
+  const reasons = (monitoreo?.drivers ?? []).map((d) => DRIVER_LABELS[d] ?? d);
+  const scenarioEntries = Object.entries(monitoreo?.escenarios ?? {});
+  const steps = (monitoreo?.acciones ?? []).map((a) => ACCION_STEPS[a]).filter(Boolean) as string[];
 
   return (
     <div className="px-6 pt-4 pb-24">
@@ -506,102 +702,147 @@ function HelpScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
         </div>
       </div>
 
-      <div className="mb-4 space-y-2">
-        {riskReasons[risk].map((r, i) => (
-          <div key={i} className="flex gap-2 items-start">
-            <span className={`text-xs font-bold mt-0.5 ${cfg.badge.text}`}>!</span>
-            <p className="text-sm text-[var(--color-foreground)]">{r}</p>
-          </div>
-        ))}
-      </div>
-
-      <HairlineRule className="my-4"/>
-
-      <div className="flex items-baseline gap-2 mb-2">
-        <p style={{ fontFamily:"var(--font-serif)" }} className={`text-4xl ${cfg.badge.text}`}>{cfg.cushionWeeks.toFixed(1)}</p>
-        <p className="text-sm text-[var(--color-muted-foreground)]">weeks cushion</p>
-      </div>
-      <div className="h-1.5 rounded-full bg-[var(--color-muted)] overflow-hidden mb-4">
-        <div className="h-full rounded-full" style={{ width:`${Math.min(100,(cfg.cushionWeeks/8)*100)}%`,
-          backgroundColor: risk==="stable"?"#2a9d8f":risk==="medium"?"#c4834a":"#c0392b" }}/>
-      </div>
-
-      <HairlineRule className="my-4"/>
-
-      <div className="space-y-2 mb-4">
-        {scenarios.map((s) => (
-          <div key={s.label} className="bg-[var(--color-muted)] rounded-xl p-3">
-            <p className="text-sm font-medium text-[var(--color-foreground)]">{s.label}</p>
-            <p className={`text-xs font-medium mt-0.5 ${cfg.badge.text}`}>{s.impact}</p>
-          </div>
-        ))}
-      </div>
-
-      <HairlineRule className="my-4"/>
-
-      <div className="space-y-2 mb-5">
-        {steps.map((s, i) => (
-          <div key={i} className="flex gap-3 items-start">
-            <div className="w-5 h-5 rounded-full flex items-center justify-center shrink-0 text-[10px] font-bold text-white"
-              style={{ backgroundColor: risk==="stable"?"#2a9d8f":risk==="medium"?"#c4834a":"#c0392b" }}>
-              {i+1}
-            </div>
-            <p className="text-sm text-[var(--color-foreground)] pt-0.5">{s}</p>
-          </div>
-        ))}
-      </div>
-
-      {risk === "high" && (
-        <div className="space-y-3">
-          {!trustedSent ? (
-            <button onClick={() => setTrustedSent(true)}
-              className="w-full flex items-center justify-center gap-2 border border-[var(--color-border)] rounded-2xl py-4 text-sm font-medium text-[var(--color-foreground)] bg-white">
-              Notify a Trusted Person
-            </button>
-          ) : (
-            <div className="w-full border border-[#2a9d8f] bg-[#e6f7f5] rounded-2xl py-4 flex items-center justify-center text-sm font-medium text-[#2a9d8f]">
-              ✓ Trusted contact notified
-            </div>
+      {loading ? (
+        <p className="text-sm text-[var(--color-muted-foreground)]">Loading your risk details…</p>
+      ) : (
+        <>
+          {monitoreo?.texto && (
+            <SpeechBubble className="mb-4">
+              <FormattedText text={monitoreo.texto} className="text-sm text-[var(--color-foreground)]"/>
+            </SpeechBubble>
           )}
-          <button onClick={() => setShowResources((v) => !v)}
-            className="w-full flex items-center justify-between border border-[var(--color-border)] rounded-2xl px-5 py-4 text-sm font-medium text-[var(--color-foreground)] bg-white">
-            View Assistance Resources <Chevron/>
-          </button>
-          {showResources && (
-            <div className="bg-[var(--color-muted)] rounded-2xl p-4 space-y-3">
-              {[["211.org","Local financial & food help"],["LIHEAP","Energy bill assistance"],["SNAP Benefits","Food assistance"],["Capital One Hardship","Payment plan options"]].map(([n,d]) => (
-                <div key={n} className="flex justify-between items-center">
-                  <div>
-                    <p className="text-sm font-medium text-[var(--color-foreground)]">{n}</p>
-                    <p className="text-xs text-[var(--color-muted-foreground)]">{d}</p>
-                  </div>
-                  <Chevron/>
+
+          {reasons.length > 0 && (
+            <div className="mb-4 space-y-2">
+              {reasons.map((r, i) => (
+                <div key={i} className="flex gap-2 items-start">
+                  <span className={`text-xs font-bold mt-0.5 ${cfg.badge.text}`}>!</span>
+                  <p className="text-sm text-[var(--color-foreground)]">{r}</p>
                 </div>
               ))}
             </div>
           )}
-        </div>
+
+          <HairlineRule className="my-4"/>
+
+          <div className="flex items-baseline gap-2 mb-2">
+            <p style={{ fontFamily:"var(--font-serif)" }} className={`text-4xl ${cfg.badge.text}`}>{cushion.toFixed(1)}</p>
+            <p className="text-sm text-[var(--color-muted-foreground)]">months cushion</p>
+          </div>
+          <div className="h-1.5 rounded-full bg-[var(--color-muted)] overflow-hidden mb-4">
+            <div className="h-full rounded-full" style={{ width:`${Math.min(100,(cushion/6)*100)}%`,
+              backgroundColor: risk==="stable"?"#2a9d8f":risk==="medium"?"#c4834a":"#c0392b" }}/>
+          </div>
+
+          {scenarioEntries.length > 0 && (
+            <>
+              <HairlineRule className="my-4"/>
+              <div className="space-y-2 mb-4">
+                {scenarioEntries.map(([key, hit]) => {
+                  const info = ESCENARIO_INFO[key];
+                  if (!info) return null;
+                  return (
+                    <div key={key} className="bg-[var(--color-muted)] rounded-xl p-3">
+                      <p className="text-sm font-medium text-[var(--color-foreground)]">{info.label}</p>
+                      <p className={`text-xs font-medium mt-0.5 ${cfg.badge.text}`}>{hit ? info.trueImpact : info.falseImpact}</p>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+
+          {steps.length > 0 && (
+            <>
+              <HairlineRule className="my-4"/>
+              <div className="space-y-2 mb-5">
+                {steps.map((s, i) => (
+                  <div key={i} className="flex gap-3 items-start">
+                    <div className="w-5 h-5 rounded-full flex items-center justify-center shrink-0 text-[10px] font-bold text-white"
+                      style={{ backgroundColor: risk==="stable"?"#2a9d8f":risk==="medium"?"#c4834a":"#c0392b" }}>
+                      {i+1}
+                    </div>
+                    <p className="text-sm text-[var(--color-foreground)] pt-0.5">{s}</p>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          {risk === "high" && (
+            <div className="space-y-3">
+              {!trustedSent ? (
+                <button onClick={() => setTrustedSent(true)}
+                  className="w-full flex items-center justify-center gap-2 border border-[var(--color-border)] rounded-2xl py-4 text-sm font-medium text-[var(--color-foreground)] bg-white">
+                  Notify {monitoreo?.contacto?.nombre ?? "a Trusted Person"}
+                </button>
+              ) : (
+                <div className="w-full border border-[#2a9d8f] bg-[#e6f7f5] rounded-2xl py-4 px-4 flex flex-col items-center justify-center gap-1 text-center">
+                  <p className="text-sm font-medium text-[#2a9d8f]">✓ Draft ready for {monitoreo?.contacto?.canal ?? "your contact"}</p>
+                  {monitoreo?.mensaje_contacto && (
+                    <FormattedText text={monitoreo.mensaje_contacto} className="text-xs text-[var(--color-foreground)] mt-1"/>
+                  )}
+                </div>
+              )}
+              {(monitoreo?.programas?.length ?? 0) > 0 && (
+                <button onClick={() => setShowResources((v) => !v)}
+                  className="w-full flex items-center justify-between border border-[var(--color-border)] rounded-2xl px-5 py-4 text-sm font-medium text-[var(--color-foreground)] bg-white">
+                  View Assistance Resources <Chevron/>
+                </button>
+              )}
+              {showResources && (
+                <div className="bg-[var(--color-muted)] rounded-2xl p-4 space-y-3">
+                  {(monitoreo?.programas ?? []).map((p) => (
+                    <div key={p.nombre} className="flex justify-between items-center">
+                      <div>
+                        <p className="text-sm font-medium text-[var(--color-foreground)]">{p.nombre}</p>
+                        <p className="text-xs text-[var(--color-muted-foreground)]">{p.via}</p>
+                      </div>
+                      <Chevron/>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
 }
 
 // ─── Simulate screen ──────────────────────────────────────────────────────────
-const SIM_OPTIONS = {
-  spend: { label:"Spend Now", pros:["Immediate need met"], cons:["Reduces buffer","No interest"], risk:"Medium", opp:"None this cycle" },
-  delay: { label:"Delay",     pros:["Buys time"],          cons:["Possible late fees"],           risk:"Medium–High", opp:"Next paycheck covers it" },
-  save:  { label:"Save",      pros:["Builds cushion","4.6% APY"], cons:["Less liquid now"],       risk:"Low", opp:"Compound growth" },
+// backend/plan.py simular_compra() always runs exactly these three scenarios —
+// they line up 1:1 with the tabs below.
+const SIM_ESCENARIOS = {
+  spend: { label:"Spend Now", key:"gastar_ahora",     pros:["Immediate need met"],        cons:["Reduces buffer","No interest"] },
+  delay: { label:"Delay",     key:"posponer_6m",      pros:["Buys time"],                 cons:["Possible late fees"] },
+  save:  { label:"Save",      key:"no_gastar_y_ahorrar", pros:["Builds cushion","Earns interest"], cons:["Less liquid now"] },
 };
-type SimKey = keyof typeof SIM_OPTIONS;
+type SimKey = keyof typeof SIM_ESCENARIOS;
 
 function SimulateScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
-  const cfg    = RISK[risk];
+  const cfg    = RISK_STYLE[risk];
   const [amount, setAmount] = useState("");
   const [active, setActive] = useState<SimKey>("save");
-  const d      = SIM_OPTIONS[active];
+  const [sim, setSim]       = useState<Simulacion | null>(null);
+  const [loading, setLoading] = useState(false);
   const parsed = parseFloat(amount) || 0;
-  const checkingAfter = 2847.60 - (active === "spend" ? parsed : 0);
-  const cushionAfter  = active === "save" ? cfg.cushionWeeks + parsed/500 : active === "delay" ? cfg.cushionWeeks - 0.3 : cfg.cushionWeeks - parsed/800;
+
+  useEffect(() => {
+    if (parsed <= 0) { setSim(null); return; }
+    const t = setTimeout(() => {
+      setLoading(true);
+      simular(parsed, 6) // POST /simulacion — backend/plan.py simular_compra()
+        .then((r) => setSim(r))
+        .catch(() => setSim(null))
+        .finally(() => setLoading(false));
+    }, 450);
+    return () => clearTimeout(t);
+  }, [parsed]);
+
+  const d = SIM_ESCENARIOS[active];
+  const resultado = sim?.resultados.find((r) => r.escenario === d.key) ?? null;
 
   return (
     <div className="px-6 pt-4 pb-24">
@@ -618,10 +859,10 @@ function SimulateScreen({ onBack, risk }: { onBack: () => void; risk: RiskState 
         </div>
       </div>
       <div className="flex gap-1 bg-[var(--color-muted)] rounded-xl p-1 mb-5">
-        {(Object.keys(SIM_OPTIONS) as SimKey[]).map((k) => (
+        {(Object.keys(SIM_ESCENARIOS) as SimKey[]).map((k) => (
           <button key={k} onClick={() => setActive(k)}
             className={`flex-1 text-xs font-semibold py-2 rounded-lg transition-all ${active===k?"bg-white text-[var(--color-primary)] shadow-sm":"text-[var(--color-muted-foreground)]"}`}>
-            {SIM_OPTIONS[k].label}
+            {SIM_ESCENARIOS[k].label}
           </button>
         ))}
       </div>
@@ -639,31 +880,46 @@ function SimulateScreen({ onBack, risk }: { onBack: () => void; risk: RiskState 
         <div className="flex gap-3">
           <div className="flex-1 bg-[var(--color-muted)] rounded-xl p-3">
             <p className="text-[10px] font-semibold text-[var(--color-muted-foreground)] uppercase mb-1" style={{ letterSpacing:"0.08em" }}>Risk</p>
-            <p className="text-sm font-medium text-[var(--color-foreground)]">{d.risk}</p>
+            <p className="text-sm font-medium text-[var(--color-foreground)]">{resultado ? NIVEL_LABEL_EN[resultado.riesgo] : (loading ? "…" : "—")}</p>
           </div>
           <div className="flex-1 bg-[var(--color-secondary)] rounded-xl p-3">
-            <p className="text-[10px] font-semibold text-[var(--color-primary)] uppercase mb-1" style={{ letterSpacing:"0.08em" }}>Opportunity</p>
-            <p className="text-xs text-[var(--color-foreground)]">{d.opp}</p>
+            <p className="text-[10px] font-semibold text-[var(--color-primary)] uppercase mb-1" style={{ letterSpacing:"0.08em" }}>Opportunity cost (12m)</p>
+            <p className="text-xs text-[var(--color-foreground)]">{sim ? `$${Math.round(sim.costo_oportunidad_12m).toLocaleString()}` : "—"}</p>
           </div>
         </div>
       </div>
       {parsed > 0 && (
         <>
           <HairlineRule className="mb-4"/>
-          <div className="space-y-3">
-            <div className="flex justify-between items-center">
-              <p className="text-sm text-[var(--color-muted-foreground)]">Checking after</p>
-              <p style={{ fontFamily:"var(--font-serif)" }} className="text-base text-[var(--color-foreground)]">
-                ${Math.max(0,checkingAfter).toLocaleString("en-US",{minimumFractionDigits:2})}
-              </p>
+          {loading && !sim ? (
+            <p className="text-sm text-[var(--color-muted-foreground)]">Running the numbers…</p>
+          ) : resultado ? (
+            <div className="space-y-3">
+              <div className="flex justify-between items-center">
+                <p className="text-sm text-[var(--color-muted-foreground)]">Savings after</p>
+                <p style={{ fontFamily:"var(--font-serif)" }} className="text-base text-[var(--color-foreground)]">
+                  ${resultado.ahorro_resultante.toLocaleString("en-US",{minimumFractionDigits:2})}
+                </p>
+              </div>
+              <div className="flex justify-between items-center">
+                <p className="text-sm text-[var(--color-muted-foreground)]">Cushion estimate</p>
+                <p className={`text-base font-semibold ${
+                  resultado.meses_colchon>=3?"text-[#2a9d8f]":resultado.meses_colchon>=1?"text-[var(--color-warning)]":"text-[#c0392b]"}`}>
+                  {Math.max(0,resultado.meses_colchon).toFixed(1)} months
+                </p>
+              </div>
+              {resultado.descubierto && (
+                <p className="text-xs font-medium text-[#c0392b]">⚠ This would leave you overdrawn.</p>
+              )}
+              {sim?.texto && (
+                <SpeechBubble className="mt-2">
+                  <FormattedText text={sim.texto} className="text-sm text-[var(--color-foreground)]"/>
+                </SpeechBubble>
+              )}
             </div>
-            <div className="flex justify-between items-center">
-              <p className="text-sm text-[var(--color-muted-foreground)]">Cushion estimate</p>
-              <p className={`text-base font-semibold ${cushionAfter>=4?"text-[#2a9d8f]":cushionAfter>=2?"text-[var(--color-warning)]":"text-[#c0392b]"}`}>
-                {Math.max(0,cushionAfter).toFixed(1)} weeks
-              </p>
-            </div>
-          </div>
+          ) : (
+            <p className="text-sm text-[var(--color-muted-foreground)]">Couldn't reach the server — try again.</p>
+          )}
         </>
       )}
     </div>
@@ -671,23 +927,57 @@ function SimulateScreen({ onBack, risk }: { onBack: () => void; risk: RiskState 
 }
 
 // ─── Transfer / Deposit screens ───────────────────────────────────────────────
-function getReview(from: string, to: string, amount: number) {
-  const fromAcc  = ACCOUNTS.find((a) => a.id === from);
-  const remaining = (fromAcc?.value ?? 0) - amount;
-  if (to === "emergency") return { summary:`Moving $${amount} to Emergency Fund.`, pros:["Builds safety net"], cons:[`Checking → $${remaining.toFixed(0)}`] };
-  if (to === "hysa")      return { summary:`$${amount} earning 4.6% APY immediately.`, pros:["Earns interest","FDIC insured"], cons:[`Checking → $${remaining.toFixed(0)}`] };
-  return { summary:`Transferring $${amount} from ${fromAcc?.label}.`, pros:["Intentional move"], cons:[`Checking → $${remaining.toFixed(0)}`] };
-}
+interface TransferPreview { ok: boolean; veredicto?: string; texto?: string }
 
-function TransferScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
-  const [from, setFrom] = useState("checking");
-  const [to, setTo]     = useState("");
+function TransferScreen({ onBack, risk, accounts, onMutated }:
+  { onBack: () => void; risk: RiskState; accounts: Account[]; onMutated: () => Promise<void> }) {
+  const [from, setFrom]   = useState("checking");
+  const [to, setTo]       = useState("");
   const [amount, setAmount] = useState("");
-  const [done, setDone] = useState(false);
-  const isReady = from && to && to !== from && parseFloat(amount) > 0;
-  const review  = isReady ? getReview(from, to, parseFloat(amount)) : null;
-  const frogImg = RISK[risk].frog;
+  const [done, setDone]   = useState(false);
+  const [busy, setBusy]   = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [preview, setPreview] = useState<TransferPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const isReady = Boolean(from && to && to !== from && parseFloat(amount) > 0);
+  const frogImg = RISK_STYLE[risk].frog;
   const sel = "w-full border border-[var(--color-border)] rounded-xl px-4 py-3 text-sm bg-white appearance-none focus:outline-none focus:border-[var(--color-primary)] transition-colors";
+
+  // CapiFrog's advice on the transfer, fetched BEFORE anything moves — a
+  // dry-run against POST /transferencia/preview (backend/main.py), which
+  // computes the same verdict+text as the real transfer without touching
+  // any balances.
+  useEffect(() => {
+    if (!isReady) { setPreview(null); return; }
+    const t = setTimeout(() => {
+      setPreviewLoading(true);
+      transferirPreview(ACCOUNT_BACKEND_KEY[from as AccountId], ACCOUNT_BACKEND_KEY[to as AccountId], parseFloat(amount))
+        .then((r) => setPreview(r))
+        .catch(() => setPreview(null))
+        .finally(() => setPreviewLoading(false));
+    }, 450);
+    return () => clearTimeout(t);
+  }, [isReady, from, to, amount]);
+
+  async function confirm() {
+    if (!isReady || busy || preview?.ok === false) return;
+    setBusy(true);
+    setErrorMsg(null);
+    try {
+      // POST /transferencia — actually moves the money.
+      const r = await transferir(ACCOUNT_BACKEND_KEY[from as AccountId], ACCOUNT_BACKEND_KEY[to as AccountId], parseFloat(amount));
+      if (!r.ok) {
+        setErrorMsg(r.texto || "That transfer didn't go through.");
+        return;
+      }
+      await onMutated();
+      setDone(true);
+    } catch {
+      setErrorMsg("Couldn't reach the server — try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   if (done) return (
     <div className="px-6 pt-12 pb-24 flex flex-col items-center text-center">
@@ -702,8 +992,8 @@ function TransferScreen({ onBack, risk }: { onBack: () => void; risk: RiskState 
       <BackButton onBack={onBack}/>
       <p style={{ fontFamily:"var(--font-serif)" }} className="text-2xl text-[var(--color-foreground)] mb-6">Transfer</p>
       <div className="space-y-4">
-        {[{lbl:"From",val:from,set:setFrom,opts:ACCOUNTS.filter((a)=>a.id!=="bills"),bal:true},
-          {lbl:"To",  val:to,  set:setTo,  opts:ACCOUNTS.filter((a)=>a.id!==from&&a.id!=="bills"),bal:false}
+        {[{lbl:"From",val:from,set:setFrom,opts:accounts.filter((a)=>a.id!=="bills"),bal:true},
+          {lbl:"To",  val:to,  set:setTo,  opts:accounts.filter((a)=>a.id!==from&&a.id!=="bills"),bal:false}
         ].map(({lbl,val,set,opts,bal}) => (
           <div key={lbl}>
             <p className="text-[10px] text-[var(--color-muted-foreground)] uppercase mb-1.5" style={{ letterSpacing:"0.1em" }}>{lbl}</p>
@@ -725,19 +1015,29 @@ function TransferScreen({ onBack, risk }: { onBack: () => void; risk: RiskState 
           </div>
         </div>
       </div>
-      {isReady && review && (
+      {isReady && (
         <div className="mt-7">
           <HairlineRule className="mb-5"/>
-          <SpeechBubbleDown className="mb-4">
-            <p className="text-sm text-[var(--color-foreground)] mb-2">{review.summary}</p>
-            {review.pros.map((p) => <p key={p} className="text-xs text-[#2a9d8f]">↑ {p}</p>)}
-            {review.cons.map((c) => <p key={c} className="text-xs text-[var(--color-warning)]">↓ {c}</p>)}
-          </SpeechBubbleDown>
+          {previewLoading && !preview ? (
+            <p className="text-sm text-[var(--color-muted-foreground)] mb-4">CapiFrog is checking this transfer…</p>
+          ) : preview?.ok === false ? (
+            <p className="text-sm font-medium text-[#c0392b] mb-4">{preview.texto ?? "That transfer isn't possible."}</p>
+          ) : preview ? (
+            <SpeechBubbleDown className="mb-4">
+              {preview.veredicto && VEREDICTO_LABELS[preview.veredicto] && (
+                <span className="inline-block text-[10px] font-bold text-[var(--color-primary)] bg-[var(--color-secondary)] px-2 py-0.5 rounded-full mb-2">
+                  {VEREDICTO_LABELS[preview.veredicto]}
+                </span>
+              )}
+              {preview.texto && <FormattedText text={preview.texto} className="text-sm text-[var(--color-foreground)]"/>}
+            </SpeechBubbleDown>
+          ) : null}
+          {errorMsg && <p className="text-xs font-medium text-[#c0392b] mb-3">{errorMsg}</p>}
           <div className="flex items-end gap-3">
             <img src={frogImg} alt="frog" className="w-11 h-11 object-contain shrink-0"/>
             <div className="flex gap-2 flex-1">
-              <button onClick={onBack} className="flex-1 border border-[var(--color-border)] rounded-xl py-3 text-sm text-[var(--color-muted-foreground)] font-medium">Cancel</button>
-              <button onClick={() => setDone(true)} className="flex-1 bg-[var(--color-primary)] text-white rounded-xl py-3 text-sm font-medium">Confirm</button>
+              <button onClick={onBack} disabled={busy} className="flex-1 border border-[var(--color-border)] rounded-xl py-3 text-sm text-[var(--color-muted-foreground)] font-medium disabled:opacity-60">Cancel</button>
+              <button onClick={confirm} disabled={busy || preview?.ok === false} className="flex-1 bg-[var(--color-primary)] text-white rounded-xl py-3 text-sm font-medium disabled:opacity-60">{busy ? "Sending…" : "Confirm"}</button>
             </div>
           </div>
         </div>
@@ -746,12 +1046,34 @@ function TransferScreen({ onBack, risk }: { onBack: () => void; risk: RiskState 
   );
 }
 
-function DepositScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
-  const [to, setTo]     = useState("checking");
+function DepositScreen({ onBack, risk, accounts, onMutated }:
+  { onBack: () => void; risk: RiskState; accounts: Account[]; onMutated: () => Promise<void> }) {
+  const [to, setTo]         = useState("checking");
   const [amount, setAmount] = useState("");
-  const [done, setDone] = useState(false);
-  const frogImg = RISK[risk].frog;
+  const [done, setDone]     = useState(false);
+  const [busy, setBusy]     = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const frogImg = RISK_STYLE[risk].frog;
   const sel = "w-full border border-[var(--color-border)] rounded-xl px-4 py-3 text-sm bg-white appearance-none focus:outline-none focus:border-[var(--color-primary)] transition-colors";
+  const toAcc = accounts.find((a) => a.id === to);
+
+  async function confirm() {
+    const parsed = parseFloat(amount);
+    if (!(parsed > 0) || !toAcc || busy) return;
+    setBusy(true);
+    setErrorMsg(null);
+    try {
+      // No dedicated deposit endpoint yet — add to the balance via the
+      // generic PATCH /cuentas edit endpoint (backend/estado.py actualizar_cuentas()).
+      await editarCuentas({ [ACCOUNT_BACKEND_KEY[to as AccountId]]: toAcc.value + parsed });
+      await onMutated();
+      setDone(true);
+    } catch {
+      setErrorMsg("Couldn't reach the server — try again.");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   if (done) return (
     <div className="px-6 pt-12 pb-24 flex flex-col items-center text-center">
@@ -770,7 +1092,7 @@ function DepositScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }
           <p className="text-[10px] text-[var(--color-muted-foreground)] uppercase mb-1.5" style={{ letterSpacing:"0.1em" }}>Into</p>
           <div className="relative">
             <select value={to} onChange={(e) => setTo(e.target.value)} className={sel}>
-              {ACCOUNTS.filter((a) => a.id !== "bills").map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
+              {accounts.filter((a) => a.id !== "bills").map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}
             </select>
             <svg className="absolute right-3 top-3.5 text-[var(--color-muted-foreground)] pointer-events-none" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M2.5 5l4.5 4.5L11.5 5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/></svg>
           </div>
@@ -790,10 +1112,13 @@ function DepositScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }
           <div className="flex items-end gap-3 mb-5">
             <img src={frogImg} alt="frog" className="w-11 h-11 object-contain shrink-0"/>
             <SpeechBubble className="flex-1">
-              <p className="text-sm">Depositing ${parseFloat(amount).toFixed(2)} into {ACCOUNTS.find((a)=>a.id===to)?.label}.</p>
+              <p className="text-sm">Depositing ${parseFloat(amount).toFixed(2)} into {toAcc?.label}.</p>
             </SpeechBubble>
           </div>
-          <button onClick={() => setDone(true)} className="w-full bg-[var(--color-primary)] text-white rounded-xl py-3 text-sm font-medium">Confirm Deposit</button>
+          {errorMsg && <p className="text-xs font-medium text-[#c0392b] mb-3">{errorMsg}</p>}
+          <button onClick={confirm} disabled={busy} className="w-full bg-[var(--color-primary)] text-white rounded-xl py-3 text-sm font-medium disabled:opacity-60">
+            {busy ? "Recording…" : "Confirm Deposit"}
+          </button>
         </div>
       )}
     </div>
@@ -801,50 +1126,63 @@ function DepositScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }
 }
 
 // ─── Home screen ──────────────────────────────────────────────────────────────
-function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => void }) {
-  const cfg = RISK[risk];
-  const insights = RISK_INSIGHTS[risk];
+function HomeScreen({ risk, usuario, cuentas, riesgo, plan, revisionTexto, accounts, onNav }: {
+  risk: RiskState; usuario: Usuario; cuentas: Cuentas; riesgo: Riesgo; plan: Plan | null;
+  revisionTexto: string | null; accounts: Account[]; onNav: (s: Screen) => void;
+}) {
+  const cfg = RISK_STYLE[risk];
+  // Real paragraphs from CapiFrog's own explanation (GET /revision) — a
+  // handful of substantial slides instead of many one-line fragments.
+  const slides = revisionTexto ? splitParagraphs(revisionTexto) : [fallbackSummary(risk, riesgo, plan)];
   const [insightIdx, setInsightIdx] = useState(0);
   const [fade, setFade]             = useState(true);
   const [showCR, setShowCR]         = useState(false);
   const [openAccount, setOpenAccount] = useState<AccountId | null>(null);
+  const cr = creditReadiness(riesgo, plan);
 
   useEffect(() => {
+    setInsightIdx(0);
+  }, [risk, revisionTexto]);
+
+  useEffect(() => {
+    if (slides.length < 2) return;
     const t = setInterval(() => {
       setFade(false);
       setTimeout(() => {
-        setInsightIdx((i) => (i + 1) % insights.length);
+        setInsightIdx((i) => (i + 1) % slides.length);
         setFade(true);
       }, 250);
-    }, 4000);
+    }, 6000);
     return () => clearInterval(t);
-  }, [insights]);
+  }, [slides.length]);
+
+  const safeToSave = plan ? Math.max(Math.round(plan.excedente_mensual), 0) : 0;
 
   // Shared sub-sections as render helpers so both layouts share the same markup
 
   const Hero = (
     <div className="flex items-start gap-3 mb-5">
-      <img src={cfg.frog} alt="CapFrog" className="w-16 h-16 lg:w-20 lg:h-20 object-contain shrink-0"/>
+      <img src={cfg.frog} alt="CapiFrog" className="w-16 h-16 lg:w-20 lg:h-20 object-contain shrink-0"/>
       <div className="flex-1 pt-1">
         <SpeechBubble>
-          <div style={{ height: "2.6rem" }} className="flex items-center mb-2">
-            <p style={{ fontFamily:"var(--font-serif)", opacity: fade ? 1 : 0, transition:"opacity 0.25s ease" }}
-               className="text-base lg:text-lg text-[var(--color-foreground)] leading-snug">
-              {insights[insightIdx]}
-            </p>
+          <div style={{ minHeight: "3rem", opacity: fade ? 1 : 0, transition:"opacity 0.25s ease" }} className="mb-2">
+            <FormattedText text={slides[insightIdx % slides.length]}
+              className="text-sm lg:text-base text-[var(--color-foreground)] leading-relaxed" />
           </div>
           <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full ${cfg.badge.bg}`}>
             <div className={`w-1.5 h-1.5 rounded-full ${cfg.badge.dot}`}/>
             <span className={`text-[11px] font-semibold ${cfg.badge.text}`}>{cfg.label}</span>
           </div>
-          <div className="flex gap-1 mt-2">
-            {insights.map((_, i) => (
-              <div key={i} className="rounded-full transition-all" style={{
-                width: i === insightIdx ? 10 : 5, height: 5,
-                backgroundColor: i === insightIdx ? "var(--color-primary)" : "var(--color-border)",
-              }}/>
-            ))}
-          </div>
+          {slides.length > 1 && (
+            <div className="flex gap-1 mt-2">
+              {slides.map((_, i) => (
+                <div key={i} className="rounded-full transition-all" style={{
+                  width: i === insightIdx ? 10 : 5, height: 5,
+                  backgroundColor: i === insightIdx ? "var(--color-primary)" : "var(--color-border)",
+                }}/>
+              ))}
+            </div>
+          )}
         </SpeechBubble>
       </div>
     </div>
@@ -887,6 +1225,8 @@ function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => vo
     </div>
   );
 
+  // Score is derived from the same risk probability as the badge above —
+  // see creditReadiness() — so the two can never disagree.
   const CRPreview = (
     <div className="mb-5">
       <HairlineRule className="mb-5"/>
@@ -894,12 +1234,12 @@ function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => vo
         <div className="flex-1 pr-4">
           <p className="text-[10px] font-semibold uppercase text-[var(--color-muted-foreground)] mb-1" style={{ letterSpacing:"0.12em" }}>Credit Readiness</p>
           <div className="flex items-baseline gap-1.5 mb-1">
-            <p style={{ fontFamily:"var(--font-serif)" }} className="text-2xl text-[var(--color-foreground)]">{CR_SCORE}</p>
+            <p style={{ fontFamily:"var(--font-serif)" }} className="text-2xl text-[var(--color-foreground)]">{cr.score}</p>
             <p className="text-xs text-[var(--color-muted-foreground)]">/ 100</p>
-            <span className="text-xs font-semibold text-[#2a9d8f] ml-1">{CR_LABEL} ↑</span>
+            <span className="text-xs font-semibold text-[#2a9d8f] ml-1">{cr.label} {cr.trend}</span>
           </div>
           <div className="h-0.5 rounded-full bg-[var(--color-muted)] overflow-hidden w-28">
-            <div className="h-full rounded-full bg-[#2a9d8f]" style={{ width:`${CR_SCORE}%` }}/>
+            <div className="h-full rounded-full bg-[#2a9d8f]" style={{ width:`${cr.score}%` }}/>
           </div>
         </div>
         <button onClick={() => setShowCR(true)}
@@ -911,21 +1251,24 @@ function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => vo
     </div>
   );
 
-  const FinancialReview = cfg.safeToSave > 0 ? (
+  const FinancialReview = plan && plan.excedente_mensual > 0 ? (
     <>
       <HairlineRule/>
       <div className="py-5">
         <p className="text-[10px] font-semibold uppercase text-[var(--color-muted-foreground)] mb-3" style={{ letterSpacing:"0.12em" }}>Financial Review</p>
-        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[#2a9d8f] mb-3">${cfg.safeToSave}</p>
+        <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[#2a9d8f] mb-3">${safeToSave}</p>
         <div className="space-y-2">
           {[
-            { id:"emergency", label:"Rainy Day Fund",     active: cfg.saveTo === "Emergency Fund" },
-            { id:"hysa",      label:"High-Yield Savings", active: cfg.saveTo === "High-Yield Savings" },
-            { id:"shortterm", label:"Short-term Savings", active: cfg.saveTo === "Short-Term Savings" },
-          ].map((opt) => (
-            <div key={opt.id} className={`flex items-center justify-between rounded-xl px-4 py-3 border ${opt.active?"border-[#2a9d8f] bg-[#e6f7f5]":"border-[var(--color-border)] bg-[var(--color-muted)]"}`}>
-              <p className={`text-sm font-medium ${opt.active?"text-[#2a9d8f]":"text-[var(--color-foreground)]"}`}>{opt.label}</p>
-              {opt.active && <span className="text-[10px] font-bold text-[#2a9d8f] bg-white px-2 py-0.5 rounded-full border border-[#2a9d8f]">Recommended</span>}
+            { id:"fondo_lluvia",      label:"Rainy Day Fund",     amount: plan.aportaciones.fondo_lluvia },
+            { id:"alto_rendimiento",  label:"High-Yield Savings", amount: plan.aportaciones.alto_rendimiento },
+            { id:"corto_plazo",       label:"Short-term Savings", amount: plan.aportaciones.corto_plazo },
+          ].sort((a, b) => b.amount - a.amount).map((opt, i) => (
+            <div key={opt.id} className={`flex items-center justify-between rounded-xl px-4 py-3 border ${i===0?"border-[#2a9d8f] bg-[#e6f7f5]":"border-[var(--color-border)] bg-[var(--color-muted)]"}`}>
+              <p className={`text-sm font-medium ${i===0?"text-[#2a9d8f]":"text-[var(--color-foreground)]"}`}>{opt.label}</p>
+              <div className="flex items-center gap-2">
+                <p className={`text-sm ${i===0?"text-[#2a9d8f]":"text-[var(--color-foreground)]"}`}>${Math.round(opt.amount)}</p>
+                {i===0 && <span className="text-[10px] font-bold text-[#2a9d8f] bg-white px-2 py-0.5 rounded-full border border-[#2a9d8f]">Recommended</span>}
+              </div>
             </div>
           ))}
         </div>
@@ -935,7 +1278,7 @@ function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => vo
 
   const AccountsList = (
     <div className="py-4">
-      {ACCOUNTS.map((acc, i) => (
+      {accounts.map((acc, i) => (
         <div key={acc.id}>
           <button className="w-full flex items-center justify-between py-3.5 text-left"
             onClick={() => setOpenAccount(acc.id)}>
@@ -948,7 +1291,7 @@ function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => vo
               <Chevron/>
             </div>
           </button>
-          {i < ACCOUNTS.length - 1 && <HairlineRule/>}
+          {i < accounts.length - 1 && <HairlineRule/>}
         </div>
       ))}
     </div>
@@ -989,12 +1332,12 @@ function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => vo
               <div className="flex-1 pr-4">
                 <p className="text-[10px] font-semibold uppercase text-[var(--color-muted-foreground)] mb-1" style={{ letterSpacing:"0.12em" }}>Credit Readiness</p>
                 <div className="flex items-baseline gap-1.5 mb-1">
-                  <p style={{ fontFamily:"var(--font-serif)" }} className="text-2xl text-[var(--color-foreground)]">{CR_SCORE}</p>
+                  <p style={{ fontFamily:"var(--font-serif)" }} className="text-2xl text-[var(--color-foreground)]">{cr.score}</p>
                   <p className="text-xs text-[var(--color-muted-foreground)]">/ 100</p>
-                  <span className="text-xs font-semibold text-[#2a9d8f] ml-1">{CR_LABEL} ↑</span>
+                  <span className="text-xs font-semibold text-[#2a9d8f] ml-1">{cr.label} {cr.trend}</span>
                 </div>
                 <div className="h-0.5 rounded-full bg-[var(--color-muted)] overflow-hidden w-28">
-                  <div className="h-full rounded-full bg-[#2a9d8f]" style={{ width:`${CR_SCORE}%` }}/>
+                  <div className="h-full rounded-full bg-[#2a9d8f]" style={{ width:`${cr.score}%` }}/>
                 </div>
               </div>
               <button onClick={() => setShowCR(true)}
@@ -1012,12 +1355,12 @@ function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => vo
       </div>
 
       {/* Floating modals */}
-      {showCR                       && <CreditReadinessModal onClose={() => setShowCR(false)}/>}
-      {openAccount === "checking"   && <CheckingModal   onClose={() => setOpenAccount(null)}/>}
-      {openAccount === "emergency"  && <EmergencyModal  onClose={() => setOpenAccount(null)}/>}
-      {openAccount === "bills"      && <BillsModal      onClose={() => setOpenAccount(null)}/>}
-      {openAccount === "hysa"       && <HYSAModal       onClose={() => setOpenAccount(null)} risk={risk}/>}
-      {openAccount === "shortterm"  && <ShortTermModal  onClose={() => setOpenAccount(null)}/>}
+      {showCR                       && <CreditReadinessModal onClose={() => setShowCR(false)} riesgo={riesgo} plan={plan}/>}
+      {openAccount === "checking"   && <CheckingModal   onClose={() => setOpenAccount(null)} cuentas={cuentas} usuario={usuario} plan={plan}/>}
+      {openAccount === "emergency"  && <EmergencyModal  onClose={() => setOpenAccount(null)} cuentas={cuentas} usuario={usuario} plan={plan}/>}
+      {openAccount === "bills"      && <BillsModal      onClose={() => setOpenAccount(null)} cuentas={cuentas}/>}
+      {openAccount === "hysa"       && <HYSAModal       onClose={() => setOpenAccount(null)} cuentas={cuentas} plan={plan} risk={risk}/>}
+      {openAccount === "shortterm"  && <ShortTermModal  onClose={() => setOpenAccount(null)} cuentas={cuentas} plan={plan}/>}
     </>
   );
 }
@@ -1025,19 +1368,90 @@ function HomeScreen({ risk, onNav }: { risk: RiskState; onNav: (s: Screen) => vo
 // ─── App root ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [screen, setScreen] = useState<Screen>("home");
-  const [risk, setRisk]     = useState<RiskState>("stable");
 
-  // Dev toggle: tap logo 5× to cycle states
-  const devTaps  = useRef(0);
-  const devTimer = useRef<ReturnType<typeof setTimeout>>();
+  const [usuario, setUsuario] = useState<Usuario | null>(null);
+  const [cuentas, setCuentas] = useState<Cuentas | null>(null);
+  const [riesgo, setRiesgo]   = useState<Riesgo | null>(null);
+  const [plan, setPlan]       = useState<Plan | null>(null);
+  const [revisionTexto, setRevisionTexto] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState<string | null>(null);
+
+  // Pull a fresh snapshot from the backend. Used on initial load and again
+  // after any action that mutates state server-side (transfer, deposit,
+  // preset switch) — backend/main.py bundles usuario+cuentas+riesgo together,
+  // but the derived savings plan (and CapiFrog's narration of it) comes from
+  // a separate call.
+  async function refrescar() {
+    const u = await getUsuario(); // GET /usuario
+    setUsuario(u.usuario);
+    setCuentas(u.cuentas);
+    setRiesgo(u.riesgo);
+    try {
+      const r = await getRevision(); // GET /revision — backend/plan.py plan_ahorro()
+      setPlan(r.plan);
+      setRevisionTexto(r.texto ?? null);
+    } catch {
+      setPlan(null);
+      setRevisionTexto(null);
+    }
+  }
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        await refrescar();
+        if (alive) setError(null);
+      } catch {
+        if (alive) setError("Can't reach the CapiFrog server. Is the backend running on localhost:8000?");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  const risk: RiskState = riesgo ? NIVEL_TO_RISK[riesgo.nivel] : "stable";
+  const accounts = cuentas ? buildAccounts(cuentas, plan) : [];
+
+  // Dev toggle: tap logo 5× to cycle demo presets (backend/mock_user.py PRESETS)
+  const devTaps    = useRef(0);
+  const devTimer   = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const presetIdx  = useRef(0);
   function handleLogoTap() {
     devTaps.current++;
     clearTimeout(devTimer.current);
     devTimer.current = setTimeout(() => { devTaps.current = 0; }, 1500);
     if (devTaps.current >= 5) {
       devTaps.current = 0;
-      setRisk((r) => r === "stable" ? "medium" : r === "medium" ? "high" : "stable");
+      presetIdx.current = (presetIdx.current + 1) % PRESET_CYCLE.length;
+      aplicarPreset(PRESET_CYCLE[presetIdx.current]) // POST /preset/{nombre}
+        .then(() => refrescar())
+        .catch(() => {});
     }
+  }
+
+  if (loading) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-3" style={{ backgroundColor:"var(--color-background)" }}>
+        <img src={frogStable} alt="CapiFrog" className="w-16 h-16 object-contain animate-pulse"/>
+        <p className="text-sm text-[var(--color-muted-foreground)]">Loading CapiFrog…</p>
+      </div>
+    );
+  }
+
+  if (error || !usuario || !cuentas || !riesgo) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center gap-4 px-6 text-center" style={{ backgroundColor:"var(--color-background)" }}>
+        <img src={frogHigh} alt="CapiFrog" className="w-16 h-16 object-contain"/>
+        <p className="text-sm text-[var(--color-foreground)] max-w-xs">{error ?? "Something went wrong loading your data."}</p>
+        <button onClick={() => { setLoading(true); refrescar().then(() => setError(null)).catch(() => setError("Still can't reach the server.")).finally(() => setLoading(false)); }}
+          className="text-sm font-medium text-white bg-[var(--color-primary)] rounded-full px-6 py-2.5">
+          Retry
+        </button>
+      </div>
+    );
   }
 
   return (
@@ -1051,7 +1465,7 @@ export default function App() {
               <path d="M1.5 13c0-2.5 2.5-4 5.5-4s5.5 1.5 5.5 4" stroke="var(--color-primary)" strokeWidth="1.2" strokeLinecap="round"/>
             </svg>
           </div>
-          <p className="text-xs text-[var(--color-muted-foreground)] font-medium">Alex Rivera</p>
+          <p className="text-xs text-[var(--color-muted-foreground)] font-medium">{usuario.nombre}</p>
         </div>
         <img src={capitalOneLogo} alt="Capital One" className="h-6 object-contain cursor-pointer select-none"
           onClick={handleLogoTap}/>
@@ -1060,15 +1474,15 @@ export default function App() {
       {/* Home screen uses its own responsive grid; secondary screens stay centered narrow */}
       {screen === "home" ? (
         <main className="max-w-md lg:max-w-4xl mx-auto">
-          <HomeScreen risk={risk} onNav={setScreen}/>
+          <HomeScreen risk={risk} usuario={usuario} cuentas={cuentas} riesgo={riesgo} plan={plan} revisionTexto={revisionTexto} accounts={accounts} onNav={setScreen}/>
         </main>
       ) : (
         <main className="max-w-md lg:max-w-xl mx-auto lg:px-0">
           {screen === "chat"     && <ChatScreen     onBack={() => setScreen("home")} risk={risk}/>}
           {screen === "help"     && <HelpScreen     onBack={() => setScreen("home")} risk={risk}/>}
           {screen === "simulate" && <SimulateScreen onBack={() => setScreen("home")} risk={risk}/>}
-          {screen === "transfer" && <TransferScreen onBack={() => setScreen("home")} risk={risk}/>}
-          {screen === "deposit"  && <DepositScreen  onBack={() => setScreen("home")} risk={risk}/>}
+          {screen === "transfer" && <TransferScreen onBack={() => setScreen("home")} risk={risk} accounts={accounts} onMutated={refrescar}/>}
+          {screen === "deposit"  && <DepositScreen  onBack={() => setScreen("home")} risk={risk} accounts={accounts} onMutated={refrescar}/>}
         </main>
       )}
     </div>
