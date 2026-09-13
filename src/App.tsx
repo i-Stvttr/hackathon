@@ -4,6 +4,7 @@ import frogStable     from "@/imports/image-5.png";
 import frogMedium     from "@/imports/MONEY_GETTING_TIGHT_.jpeg";
 import frogHigh       from "@/imports/high risk.jpg";
 import transferImg    from "@/imports/transfer.jpg";
+import savingsImg     from "@/imports/SAVINGS.jpeg";
 import {
   getUsuario, getRevision, getMonitoreo,
   editarUsuario, editarCuentas, aplicarPreset,
@@ -1039,7 +1040,6 @@ function TransferScreen({ onBack, risk, accounts, onMutated }:
   const [preview, setPreview] = useState<TransferPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const isReady = Boolean(from && to && to !== from && parseFloat(amount) > 0);
-  const frogImg = RISK_STYLE[risk].frog;
   const sel = "w-full border border-[var(--color-border)] rounded-xl px-4 py-3 text-sm bg-white appearance-none focus:outline-none focus:border-[var(--color-primary)] transition-colors";
 
   // CapiFrog's advice on the transfer, fetched BEFORE anything moves — a
@@ -1080,7 +1080,7 @@ function TransferScreen({ onBack, risk, accounts, onMutated }:
 
   if (done) return (
     <div className="px-6 pt-12 pb-24 flex flex-col items-center text-center">
-      <img src={transferImg} alt="Transfer complete" className="w-24 h-24 object-contain mb-5"/>
+      <img src={savingsImg} alt="Transfer complete" className="w-24 h-24 object-contain mb-5"/>
       <p style={{ fontFamily:"var(--font-serif)" }} className="text-2xl text-[var(--color-foreground)] mb-2">Transfer sent!</p>
       <button onClick={onBack} className="text-sm font-medium text-[var(--color-primary)] border border-[var(--color-border)] rounded-full px-6 py-2.5">Back</button>
     </div>
@@ -1133,7 +1133,7 @@ function TransferScreen({ onBack, risk, accounts, onMutated }:
           ) : null}
           {errorMsg && <p className="text-xs font-medium text-[#c0392b] mb-3">{errorMsg}</p>}
           <div className="flex items-end gap-3">
-            <img src={frogImg} alt="frog" className="w-11 h-11 object-contain shrink-0"/>
+            <img src={transferImg} alt="frog" className="w-11 h-11 object-contain shrink-0"/>
             <div className="flex gap-2 flex-1">
               <button onClick={onBack} disabled={busy} className="flex-1 border border-[var(--color-border)] rounded-xl py-3 text-sm text-[var(--color-muted-foreground)] font-medium disabled:opacity-60">Cancel</button>
               <button onClick={confirm} disabled={busy || previewLoading || !preview || preview.ok === false} className="flex-1 bg-[var(--color-primary)] text-white rounded-xl py-3 text-sm font-medium disabled:opacity-60">{busy ? "Sending…" : "Confirm"}</button>
