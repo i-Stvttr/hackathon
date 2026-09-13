@@ -55,7 +55,14 @@ Based on this analysis, CapiFrog:
 |  **Figma** | UI/UX design and prototyping |
 |  **GitHub** | Version control and project collaboration |
 |  **ESLint 10** | Code quality and linting |
+|  **Vercel** | Frontend deployment and hosting |
+| **Render** | Backend deployment and API hosting |
 
+---
+
+##  Deployment
+
+The **CapiFrog frontend** was deployed using **Vercel**, while the **backend and API** were deployed using **Render**, allowing both parts of the application to work together in a production environment.
 
 ---
 
