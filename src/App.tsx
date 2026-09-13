@@ -6,7 +6,7 @@ import frogHigh       from "@/imports/SAVINGS.jpeg";
 import {
   getUsuario, getRevision, getMonitoreo,
   editarUsuario, editarCuentas, aplicarPreset,
-  simular, transferirPreview, transferir, chatear,
+  simularDetalle, transferirPreview, transferir, chatear,
 } from "./api";
 import ProfileUpdateFlow, { type ProfileAnswers } from "./onboarding/ProfileUpdateFlow";
 import { ONBOARDING_DATA_KEY, type StoredOnboardingData } from "./onboarding/OnboardingGate";
@@ -65,30 +65,16 @@ interface Monitoreo {
   escenarios?: Record<string, boolean>;
   contacto?: { nombre: string; canal: string; telefono: string };
   programas?: { nombre: string; via: string }[];
-  texto?: string | null;
+  why?: string | null;
+  whatif?: string | null;
+  history?: string | null;
   mensaje_contacto?: string;
-}
-interface SimResultado {
-  escenario: string;
-  ahorro_resultante: number;
-  meses_colchon: number;
-  riesgo: NivelRiesgo;
-  prob_riesgo: number;
-  prob_quiebra_6m: number;
-  descubierto: boolean;
-}
-interface Simulacion {
-  monto: number;
-  resultados: SimResultado[];
-  costo_oportunidad_12m: number;
-  texto: string;
 }
 
 // ─── Backend ↔ frontend mappings ───────────────────────────────────────────
 // backend/estado.py risk labels ("bajo"/"medio"/"alto") vs the frontend's
 // stable/medium/high palette.
 const NIVEL_TO_RISK: Record<NivelRiesgo, RiskState> = { bajo: "stable", medio: "medium", alto: "high" };
-const NIVEL_LABEL_EN: Record<NivelRiesgo, string> = { bajo: "Low", medio: "Medium", alto: "High" };
 
 // Frontend account ids vs backend/mock_user.py CUENTAS keys.
 const ACCOUNT_BACKEND_KEY: Record<AccountId, keyof Cuentas> = {
@@ -111,21 +97,6 @@ const DRIVER_LABELS: Record<string, string> = {
   ratio_discrecional:   "high discretionary spending",
 };
 
-// backend/plan.py monitorear() escenarios
-const ESCENARIO_INFO: Record<string, { label: string; trueImpact: string; falseImpact: string }> = {
-  pierde_un_pago:        { label: "Miss a paycheck",            trueImpact: "Your buffer likely runs out before the next one.", falseImpact: "Your buffer covers a missed paycheck." },
-  pierde_empleo_3m:      { label: "Lose income for 3 months",   trueImpact: "Savings would not last 3 months.",                  falseImpact: "Savings could cover 3 months." },
-  emergencia_medica_20k: { label: "$20,000 medical emergency",  trueImpact: "Liquid savings would not cover it.",                falseImpact: "Liquid savings could absorb it." },
-};
-
-// backend/plan.py monitorear() acciones
-const ACCION_STEPS: Record<string, string> = {
-  notificacion:               "Review this alert and your recent spending",
-  alerta:                     "Avoid new discretionary spending this week",
-  ofrecer_contacto_confianza: "Consider notifying your trusted contact",
-  mostrar_programas:          "Look into the assistance programs below",
-};
-
 const VEREDICTO_LABELS: Record<string, string> = {
   adecuado:         "Looks good",
   demasiado:        "Larger than usual for this account",
@@ -138,12 +109,13 @@ const VEREDICTO_LABELS: Record<string, string> = {
 const PRESET_CYCLE = ["sano", "ajustado", "critico"] as const;
 
 // ─── Onboarding profile → backend feature ──────────────────────────────────
-// The only onboarding answer with a real counterpart in the risk model is
-// income predictability — that's exactly backend/features.py's
-// "estabilidad_ingreso" (0-1), which the trained model already uses. This is
-// the one honest bridge from the onboarding questions to an actual
-// prediction change; "goals" only re-prioritizes the Safe to Save pick
-// client-side (see topBucket()) since the backend has no goals concept.
+// Income predictability has a real counterpart in the risk model —
+// backend/features.py's "estabilidad_ingreso" (0-1) — pushed via PATCH
+// /usuario so it actually changes predictions, not just displayed text.
+// The full profile (goals + predictability) is also sent along with chat,
+// simulate-detail, and transfer requests (see perfilPayload()) so Gemini's
+// explanations can reference stated goals directly; client-side, "goals"
+// additionally re-prioritizes the Safe to Save pick (see topBucket()).
 function estimateEstabilidad(p: ProfileAnswers["predictability"]): number {
   const base: Record<string, number> = { same: 0.9, somewhat: 0.65, alot: 0.4, project: 0.35, unsure: 0.5 };
   const adj:  Record<string, number> = { several: 0.05, one_two: 0, onetime: -0.05, unsure: 0 };
@@ -164,6 +136,39 @@ function readStoredProfile(): ProfileAnswers | null {
 function storeProfile(answers: ProfileAnswers) {
   const payload: StoredOnboardingData = { answers, completedAt: new Date().toISOString() };
   window.localStorage.setItem(ONBOARDING_DATA_KEY, JSON.stringify(payload));
+}
+
+// Shape backend/main.py's Perfil model expects. Read fresh from storage at
+// each call site rather than threaded through props — it's a cheap
+// synchronous read and every screen that needs it already imports from here.
+function perfilPayload(): { goals: string[]; predictability: string | null; recurring: string | null } | undefined {
+  const stored = readStoredProfile();
+  if (!stored) return undefined;
+  return {
+    goals: stored.goals.goals,
+    predictability: stored.predictability.predictability || null,
+    recurring: stored.predictability.recurring || null,
+  };
+}
+
+// ─── Per-account savings goals ──────────────────────────────────────────────
+// A small user-set target per account (distinct from the onboarding
+// "goals" categories above) — e.g. "$1,500 in Short-term Savings for a
+// trip". Purely local: there's no backend concept of a per-account goal,
+// but it feeds topBucket()'s pick and reason above.
+const ACCOUNT_GOALS_KEY = "capifrog_account_goals";
+
+function readAccountGoals(): Partial<Record<keyof Cuentas, number>> {
+  try {
+    const raw = window.localStorage.getItem(ACCOUNT_GOALS_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeAccountGoals(goals: Partial<Record<keyof Cuentas, number>>) {
+  window.localStorage.setItem(ACCOUNT_GOALS_KEY, JSON.stringify(goals));
 }
 
 // ─── Static per-tier styling (frog art + badge colors only — numbers below
@@ -244,7 +249,16 @@ const GOAL_TO_BUCKET: Record<string, keyof Plan["aportaciones"]> = {
   save:      "alto_rendimiento",
 };
 
-function topBucket(plan: Plan, goals: string[] = []) {
+// Benefit each bucket actually offers, independent of any goal — the
+// reason shown in Safe to Save should always be about why that account is
+// worth saving into, not about "reaching a goal" the user may never have set.
+const BUCKET_BENEFIT: Record<"fondo_lluvia" | "alto_rendimiento" | "corto_plazo", string> = {
+  fondo_lluvia:     "Builds your safety net for emergencies.",
+  alto_rendimiento: "Earns the most interest of your savings options.",
+  corto_plazo:      "Grows your short-term savings fastest.",
+};
+
+function topBucket(plan: Plan, cuentas: Cuentas, goals: string[] = [], accountGoals: Partial<Record<keyof Cuentas, number>> = {}) {
   const buckets = [
     { key: "fondo_lluvia" as const,     label: "Emergency Fund",     amount: plan.aportaciones.fondo_lluvia },
     { key: "alto_rendimiento" as const, label: "High-Yield Savings", amount: plan.aportaciones.alto_rendimiento },
@@ -252,20 +266,38 @@ function topBucket(plan: Plan, goals: string[] = []) {
   ];
   const positive  = buckets.filter((b) => b.amount > 0);
   const pool      = positive.length ? positive : buckets;
-  const preferred = new Set(goals.map((g) => GOAL_TO_BUCKET[g]).filter(Boolean));
+
+  // A bucket is preferred if it matches a stated onboarding goal, OR the
+  // user set a personal goal on it that isn't met yet — either way, a real
+  // preference the user expressed, not an assumption.
+  const onboardingPreferred = new Set(goals.map((g) => GOAL_TO_BUCKET[g]).filter(Boolean));
+  const goalUnmet = new Set(
+    pool.filter((b) => {
+      const goal = accountGoals[b.key];
+      return goal != null && goal > 0 && cuentas[b.key] < goal;
+    }).map((b) => b.key),
+  );
+  const preferred = new Set([...onboardingPreferred, ...goalUnmet]);
   const preferredPool = pool.filter((b) => preferred.has(b.key));
-  return (preferredPool.length ? preferredPool : pool).sort((a, b) => b.amount - a.amount)[0];
+  const chosen = (preferredPool.length ? preferredPool : pool).sort((a, b) => b.amount - a.amount)[0];
+
+  const goal = accountGoals[chosen.key];
+  const reason = goal != null && goal > 0 && cuentas[chosen.key] < goal
+    ? `Gets you $${Math.round(Math.min(chosen.amount, goal - cuentas[chosen.key])).toLocaleString()} closer to your $${Math.round(goal).toLocaleString()} goal for this account.`
+    : BUCKET_BENEFIT[chosen.key];
+  return { ...chosen, reason };
 }
 
 // Derives a 0-100 "credit readiness" style score directly from the trained
 // risk model's probability, so it can never contradict the risk badge the
 // way a hardcoded score could. There's no separate credit-score model on
 // the backend — this is the same number the risk badge is built from.
-function creditReadiness(riesgo: Riesgo, plan: Plan | null, goals: string[] = []) {
+function creditReadiness(riesgo: Riesgo, plan: Plan | null, cuentas: Cuentas | null, goals: string[] = [],
+  accountGoals: Partial<Record<keyof Cuentas, number>> = {}) {
   const score = Math.max(0, Math.min(100, Math.round((1 - riesgo.probabilidad) * 100)));
   const label = score >= 70 ? "Building Strongly" : score >= 40 ? "Needs Attention" : "At Risk";
   const trend = score >= 40 ? "↑" : "↓";
-  const top = plan ? topBucket(plan, goals) : null;
+  const top = plan && cuentas ? topBucket(plan, cuentas, goals, accountGoals) : null;
   const action = top && top.amount > 0
     ? `Add $${Math.round(top.amount)} to your ${top.label}.`
     : "Keep an eye on your monthly spending.";
@@ -408,6 +440,47 @@ function StatRow({ label, value, accent = false }: { label: string; value: strin
   );
 }
 
+// Small inline editor for a per-account savings goal — click the amount (or
+// "Set a goal") to swap in a number field. Used in every account modal.
+function GoalEditor({ goal, onSave }: { goal: number | undefined; onSave: (v: number | null) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue]     = useState("");
+
+  if (!editing) {
+    return (
+      <div className="flex items-center justify-between py-2.5">
+        <p className="text-xs text-[var(--color-muted-foreground)]">Your Goal</p>
+        <button onClick={() => { setValue(goal ? String(goal) : ""); setEditing(true); }}
+          className="text-sm font-medium text-[var(--color-primary)]">
+          {goal ? `$${goal.toLocaleString()}` : "Set a goal"}
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="py-2.5">
+      <p className="text-xs text-[var(--color-muted-foreground)] mb-1.5">Your Goal</p>
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <span className="absolute left-3 top-2 text-xs text-[var(--color-muted-foreground)]">$</span>
+          <input type="number" placeholder="0" value={value} autoFocus onChange={(e) => setValue(e.target.value)}
+            className="w-full border border-[var(--color-border)] rounded-lg pl-6 pr-2 py-1.5 text-sm bg-white focus:outline-none focus:border-[var(--color-primary)] transition-colors"/>
+        </div>
+        <button onClick={() => { onSave(parseFloat(value) > 0 ? parseFloat(value) : null); setEditing(false); }}
+          className="text-xs font-semibold text-white bg-[var(--color-primary)] rounded-lg px-3 py-1.5 shrink-0">
+          Save
+        </button>
+        {goal != null && (
+          <button onClick={() => { onSave(null); setEditing(false); }}
+            className="text-xs font-medium text-[var(--color-muted-foreground)] shrink-0">
+            Clear
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── Light bar chart (no axes, transparent bg) ────────────────────────────────
 function MiniChart() {
   const W = 280, H = 80, BAR = 8, GAP = 2;
@@ -435,8 +508,11 @@ function MiniChart() {
 }
 
 // ─── Account modals ───────────────────────────────────────────────────────────
-function CheckingModal({ onClose, cuentas, usuario, plan }:
-  { onClose: () => void; cuentas: Cuentas; usuario: Usuario; plan: Plan | null }) {
+type AccountGoals = Partial<Record<keyof Cuentas, number>>;
+type SetAccountGoal = (key: keyof Cuentas, amount: number | null) => void;
+
+function CheckingModal({ onClose, cuentas, usuario, plan, accountGoals, onSetGoal }:
+  { onClose: () => void; cuentas: Cuentas; usuario: Usuario; plan: Plan | null; accountGoals: AccountGoals; onSetGoal: SetAccountGoal }) {
   const monthlyIncome   = usuario.ingreso_mensual;
   const monthlySpending = usuario.gastos_esenciales + usuario.gastos_discrecionales;
   const safe = plan ? Math.max(Math.round(plan.excedente_mensual), 0) : null;
@@ -453,13 +529,15 @@ function CheckingModal({ onClose, cuentas, usuario, plan }:
         <StatRow label="Monthly spending" value={`$${Math.round(monthlySpending).toLocaleString()}`} />
         <HairlineRule />
         <StatRow label="Safe to use"      value={safe != null ? `$${safe}` : "—"} accent />
+        <HairlineRule />
+        <GoalEditor goal={accountGoals.balance} onSave={(v) => onSetGoal("balance", v)}/>
       </div>
     </FloatingModal>
   );
 }
 
-function EmergencyModal({ onClose, cuentas, usuario, plan }:
-  { onClose: () => void; cuentas: Cuentas; usuario: Usuario; plan: Plan | null }) {
+function EmergencyModal({ onClose, cuentas, usuario, plan, accountGoals, onSetGoal }:
+  { onClose: () => void; cuentas: Cuentas; usuario: Usuario; plan: Plan | null; accountGoals: AccountGoals; onSetGoal: SetAccountGoal }) {
   const goal = plan?.meta_fondo_lluvia ?? cuentas.fondo_lluvia;
   const pct  = goal > 0 ? Math.min(100, Math.round((cuentas.fondo_lluvia / goal) * 100)) : 100;
   const weeksCovered = usuario.gastos_esenciales > 0
@@ -473,7 +551,9 @@ function EmergencyModal({ onClose, cuentas, usuario, plan }:
         <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[var(--color-foreground)] mb-1">
           ${Math.round(cuentas.fondo_lluvia).toLocaleString()}
         </p>
-        <p className="text-xs text-[var(--color-muted-foreground)] mb-4">of ${Math.round(goal).toLocaleString()} goal</p>
+        {/* This "goal" is the model's suggested safety target (6 months of
+            essentials) — separate from the personal goal you can set below. */}
+        <p className="text-xs text-[var(--color-muted-foreground)] mb-4">of ${Math.round(goal).toLocaleString()} suggested safety target</p>
         <div className="h-1.5 rounded-full bg-[var(--color-muted)] overflow-hidden mb-4">
           <div className="h-full rounded-full bg-[#2a9d8f]" style={{ width:`${pct}%` }}/>
         </div>
@@ -483,12 +563,15 @@ function EmergencyModal({ onClose, cuentas, usuario, plan }:
         <StatRow label="Covers essentials" value={`~${weeksCovered.toFixed(1)} weeks`} />
         <HairlineRule />
         <StatRow label="Next contribution" value={nextContribution != null ? `$${nextContribution}` : "—"} accent />
+        <HairlineRule />
+        <GoalEditor goal={accountGoals.fondo_lluvia} onSave={(v) => onSetGoal("fondo_lluvia", v)}/>
       </div>
     </FloatingModal>
   );
 }
 
-function BillsModal({ onClose, cuentas }: { onClose: () => void; cuentas: Cuentas }) {
+function BillsModal({ onClose, cuentas, accountGoals, onSetGoal }:
+  { onClose: () => void; cuentas: Cuentas; accountGoals: AccountGoals; onSetGoal: SetAccountGoal }) {
   // MOCK: the backend tracks a single "gastos_fijos" balance, not individual
   // bills with due dates — the line items below are illustrative only.
   const bills = [
@@ -526,6 +609,8 @@ function BillsModal({ onClose, cuentas }: { onClose: () => void; cuentas: Cuenta
             </div>
           ))}
         </div>
+        <HairlineRule />
+        <GoalEditor goal={accountGoals.gastos_fijos} onSave={(v) => onSetGoal("gastos_fijos", v)}/>
       </div>
     </FloatingModal>
   );
@@ -535,8 +620,8 @@ function BillsModal({ onClose, cuentas }: { onClose: () => void; cuentas: Cuenta
 // mirrored here so the displayed APY matches what the backend actually uses.
 const RENDIMIENTO_HYS_DISPLAY = 0.09;
 
-function HYSAModal({ onClose, cuentas, plan, risk }:
-  { onClose: () => void; cuentas: Cuentas; plan: Plan | null; risk: RiskState }) {
+function HYSAModal({ onClose, cuentas, plan, risk, accountGoals, onSetGoal }:
+  { onClose: () => void; cuentas: Cuentas; plan: Plan | null; risk: RiskState; accountGoals: AccountGoals; onSetGoal: SetAccountGoal }) {
   const recommended = risk === "stable";
   const yearly = plan ? Math.round(plan.interes_12m_hys) : Math.round(cuentas.alto_rendimiento * RENDIMIENTO_HYS_DISPLAY);
   return (
@@ -551,22 +636,24 @@ function HYSAModal({ onClose, cuentas, plan, risk }:
         <HairlineRule />
         <StatRow label="Est. yearly earnings" value={`$${yearly}`} accent />
         <HairlineRule />
-        <div className="pt-2.5">
+        <div className="py-2.5">
           <p className="text-xs text-[var(--color-muted-foreground)]">
             {recommended
               ? "Best place for idle cash right now — earning above inflation."
               : "When stable again, move surplus here first."}
           </p>
         </div>
+        <HairlineRule />
+        <GoalEditor goal={accountGoals.alto_rendimiento} onSave={(v) => onSetGoal("alto_rendimiento", v)}/>
       </div>
     </FloatingModal>
   );
 }
 
-function ShortTermModal({ onClose, cuentas, plan }:
-  { onClose: () => void; cuentas: Cuentas; plan: Plan | null }) {
-  // Goal is a demo placeholder — backend/estado.py has no short-term goal field yet.
-  const goal = 1000;
+function ShortTermModal({ onClose, cuentas, plan, accountGoals, onSetGoal }:
+  { onClose: () => void; cuentas: Cuentas; plan: Plan | null; accountGoals: AccountGoals; onSetGoal: SetAccountGoal }) {
+  // Goal defaults to $1,000 until the user sets their own via GoalEditor below.
+  const goal = accountGoals.corto_plazo ?? 1000;
   const pct  = Math.min(100, Math.round((cuentas.corto_plazo / goal) * 100));
   const monthly = plan && plan.excedente_mensual > 0 ? plan.excedente_mensual : 80;
   const monthsLeft = Math.max(0, Math.ceil((goal - cuentas.corto_plazo) / monthly));
@@ -586,6 +673,8 @@ function ShortTermModal({ onClose, cuentas, plan }:
         <StatRow label="Progress"          value={`${pct}%`} />
         <HairlineRule />
         <StatRow label="Est. time to goal" value={monthsLeft > 0 ? `~${monthsLeft} months` : "Goal reached"} accent />
+        <HairlineRule />
+        <GoalEditor goal={accountGoals.corto_plazo} onSave={(v) => onSetGoal("corto_plazo", v)}/>
       </div>
     </FloatingModal>
   );
@@ -595,9 +684,9 @@ function ShortTermModal({ onClose, cuentas, plan }:
 // Score/label/action are derived from the real risk probability (see
 // creditReadiness() above) so they can't contradict the risk badge. The
 // income/expense chart stays MOCK: no monthly income-history endpoint yet.
-function CreditReadinessModal({ onClose, riesgo, plan, goals }:
-  { onClose: () => void; riesgo: Riesgo; plan: Plan | null; goals: string[] }) {
-  const cr = creditReadiness(riesgo, plan, goals);
+function CreditReadinessModal({ onClose, riesgo, plan, cuentas, goals, accountGoals }:
+  { onClose: () => void; riesgo: Riesgo; plan: Plan | null; cuentas: Cuentas; goals: string[]; accountGoals: AccountGoals }) {
+  const cr = creditReadiness(riesgo, plan, cuentas, goals, accountGoals);
   return (
     <FloatingModal onClose={onClose}>
       <div className="px-6 pt-6 pb-6">
@@ -678,7 +767,7 @@ function ChatScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
     setSending(true);
     setTimeout(() => bottomRef.current?.scrollIntoView({ behavior:"smooth" }), 50);
     try {
-      const r = await chatear(q); // POST /chat — backend/chat.py
+      const r = await chatear(q, perfilPayload()); // POST /chat — backend/chat.py
       setMsgs((m) => [...m, { role:"frog", text: r.texto || "I couldn't find an answer for that." }]);
     } catch {
       setMsgs((m) => [...m, { role:"frog", text: "I couldn't reach the server just now — try again in a moment." }]);
@@ -752,9 +841,6 @@ function HelpScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
   }, []);
 
   const cushion = monitoreo?.meses_colchon ?? 0;
-  const reasons = (monitoreo?.drivers ?? []).map((d) => DRIVER_LABELS[d] ?? d);
-  const scenarioEntries = Object.entries(monitoreo?.escenarios ?? {});
-  const steps = (monitoreo?.acciones ?? []).map((a) => ACCION_STEPS[a]).filter(Boolean) as string[];
 
   return (
     <div className="px-6 pt-4 pb-24">
@@ -774,74 +860,45 @@ function HelpScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
         <p className="text-sm text-[var(--color-muted-foreground)]">Loading your risk details…</p>
       ) : (
         <>
-          {monitoreo?.texto && (
-            <SpeechBubble className="mb-4">
-              <FormattedText text={monitoreo.texto} className="text-sm text-[var(--color-foreground)]"/>
-            </SpeechBubble>
-          )}
-
-          {reasons.length > 0 && (
-            <div className="mb-4 space-y-2">
-              {reasons.map((r, i) => (
-                <div key={i} className="flex gap-2 items-start">
-                  <span className={`text-xs font-bold mt-0.5 ${cfg.badge.text}`}>!</span>
-                  <p className="text-sm text-[var(--color-foreground)]">{r}</p>
-                </div>
-              ))}
-            </div>
-          )}
-
-          <HairlineRule className="my-4"/>
-
           <div className="flex items-baseline gap-2 mb-2">
             <p style={{ fontFamily:"var(--font-serif)" }} className={`text-4xl ${cfg.badge.text}`}>{cushion.toFixed(1)}</p>
             <p className="text-sm text-[var(--color-muted-foreground)]">months cushion</p>
           </div>
-          <div className="h-1.5 rounded-full bg-[var(--color-muted)] overflow-hidden mb-4">
+          <div className="h-1.5 rounded-full bg-[var(--color-muted)] overflow-hidden mb-5">
             <div className="h-full rounded-full" style={{ width:`${Math.min(100,(cushion/6)*100)}%`,
               backgroundColor: risk==="stable"?"#2a9d8f":risk==="medium"?"#c4834a":"#c0392b" }}/>
           </div>
 
-          {scenarioEntries.length > 0 && (
-            <>
-              <HairlineRule className="my-4"/>
-              <div className="space-y-2 mb-4">
-                {scenarioEntries.map(([key, hit]) => {
-                  const info = ESCENARIO_INFO[key];
-                  if (!info) return null;
-                  return (
-                    <div key={key} className="bg-[var(--color-muted)] rounded-xl p-3">
-                      <p className="text-sm font-medium text-[var(--color-foreground)]">{info.label}</p>
-                      <p className={`text-xs font-medium mt-0.5 ${cfg.badge.text}`}>{hit ? info.trueImpact : info.falseImpact}</p>
-                    </div>
-                  );
-                })}
+          {/* Three distinctly colored sections — why (blue), what-if scenarios
+              (orange), and spending history (gray) — kept separate on purpose
+              so each kind of information reads as visually distinct, rather
+              than one undifferentiated block. */}
+          <div className="space-y-3 mb-5">
+            {monitoreo?.why && (
+              <div className="bg-[var(--color-secondary)] border border-blue-100 rounded-xl p-3">
+                <p className="text-[10px] font-semibold text-[var(--color-primary)] uppercase mb-2" style={{ letterSpacing:"0.08em" }}>Why</p>
+                <FormattedText text={monitoreo.why} className="text-xs text-[var(--color-foreground)] leading-relaxed"/>
               </div>
-            </>
-          )}
-
-          {steps.length > 0 && (
-            <>
-              <HairlineRule className="my-4"/>
-              <div className="space-y-2 mb-5">
-                {steps.map((s, i) => (
-                  <div key={i} className="flex gap-3 items-start">
-                    <div className="w-5 h-5 rounded-full flex items-center justify-center shrink-0 text-[10px] font-bold text-white"
-                      style={{ backgroundColor: risk==="stable"?"#2a9d8f":risk==="medium"?"#c4834a":"#c0392b" }}>
-                      {i+1}
-                    </div>
-                    <p className="text-sm text-[var(--color-foreground)] pt-0.5">{s}</p>
-                  </div>
-                ))}
+            )}
+            {monitoreo?.whatif && (
+              <div className="bg-[var(--color-warning-bg)] border border-orange-200 rounded-xl p-3">
+                <p className="text-[10px] font-semibold text-[var(--color-warning)] uppercase mb-2" style={{ letterSpacing:"0.08em" }}>What If</p>
+                <FormattedText text={monitoreo.whatif} className="text-xs text-[var(--color-foreground)] leading-relaxed"/>
               </div>
-            </>
-          )}
+            )}
+            {monitoreo?.history && (
+              <div className="bg-[var(--color-muted)] rounded-xl p-3">
+                <p className="text-[10px] font-semibold text-[var(--color-muted-foreground)] uppercase mb-2" style={{ letterSpacing:"0.08em" }}>Your Spending History</p>
+                <FormattedText text={monitoreo.history} className="text-xs text-[var(--color-foreground)] leading-relaxed"/>
+              </div>
+            )}
+          </div>
 
           {risk === "high" && (
             <div className="space-y-3">
               {!trustedSent ? (
                 <button onClick={() => setTrustedSent(true)}
-                  className="w-full flex items-center justify-center gap-2 border border-[var(--color-border)] rounded-2xl py-4 text-sm font-medium text-[var(--color-foreground)] bg-white">
+                  className="w-full flex items-center justify-center gap-2 border border-[#2a9d8f] bg-[#e6f7f5] rounded-2xl py-4 text-sm font-medium text-[#2a9d8f]">
                   Notify {monitoreo?.contacto?.nombre ?? "a Trusted Person"}
                 </button>
               ) : (
@@ -854,12 +911,12 @@ function HelpScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
               )}
               {(monitoreo?.programas?.length ?? 0) > 0 && (
                 <button onClick={() => setShowResources((v) => !v)}
-                  className="w-full flex items-center justify-between border border-[var(--color-border)] rounded-2xl px-5 py-4 text-sm font-medium text-[var(--color-foreground)] bg-white">
+                  className="w-full flex items-center justify-between border border-red-200 bg-[var(--color-danger-bg)] rounded-2xl px-5 py-4 text-sm font-medium text-[#c0392b]">
                   View Assistance Resources <Chevron/>
                 </button>
               )}
               {showResources && (
-                <div className="bg-[var(--color-muted)] rounded-2xl p-4 space-y-3">
+                <div className="bg-[var(--color-danger-bg)] border border-red-200 rounded-2xl p-4 space-y-3">
                   {(monitoreo?.programas ?? []).map((p) => (
                     <div key={p.nombre} className="flex justify-between items-center">
                       <div>
@@ -883,34 +940,38 @@ function HelpScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
 // backend/plan.py simular_compra() always runs exactly these three scenarios —
 // they line up 1:1 with the tabs below.
 const SIM_ESCENARIOS = {
-  spend: { label:"Spend Now", key:"gastar_ahora",     pros:["Immediate need met"],        cons:["Reduces buffer","No interest"] },
-  delay: { label:"Delay",     key:"posponer_6m",      pros:["Buys time"],                 cons:["Possible late fees"] },
-  save:  { label:"Save",      key:"no_gastar_y_ahorrar", pros:["Builds cushion","Earns interest"], cons:["Less liquid now"] },
+  spend: { label:"Spend Now", key:"gastar_ahora" },
+  delay: { label:"Delay",     key:"posponer_6m" },
+  save:  { label:"Save",      key:"no_gastar_y_ahorrar" },
 };
 type SimKey = keyof typeof SIM_ESCENARIOS;
+
+interface EscenarioDetalle { pros: string; cons: string; risk: string }
 
 function SimulateScreen({ onBack, risk }: { onBack: () => void; risk: RiskState }) {
   const cfg    = RISK_STYLE[risk];
   const [amount, setAmount] = useState("");
   const [active, setActive] = useState<SimKey>("save");
-  const [sim, setSim]       = useState<Simulacion | null>(null);
+  // Pros/cons/risk are per-scenario and re-fetched whenever the amount or
+  // the active tab changes — deliberately NOT a cross-scenario comparison
+  // (switching tabs would be pointless if it just repeated the same summary).
+  const [detalle, setDetalle] = useState<EscenarioDetalle | null>(null);
   const [loading, setLoading] = useState(false);
   const parsed = parseFloat(amount) || 0;
 
   useEffect(() => {
-    if (parsed <= 0) { setSim(null); return; }
+    if (parsed <= 0) { setDetalle(null); return; }
     const t = setTimeout(() => {
       setLoading(true);
-      simular(parsed, 6) // POST /simulacion — backend/plan.py simular_compra()
-        .then((r) => setSim(r))
-        .catch(() => setSim(null))
+      simularDetalle(parsed, SIM_ESCENARIOS[active].key, perfilPayload(), 6) // POST /simulacion/detalle
+        .then((r) => setDetalle(r.pros ? { pros: r.pros, cons: r.cons, risk: r.risk } : null))
+        .catch(() => setDetalle(null))
         .finally(() => setLoading(false));
     }, 450);
     return () => clearTimeout(t);
-  }, [parsed]);
+  }, [parsed, active]);
 
   const d = SIM_ESCENARIOS[active];
-  const resultado = sim?.resultados.find((r) => r.escenario === d.key) ?? null;
 
   return (
     <div className="px-6 pt-4 pb-24">
@@ -934,61 +995,30 @@ function SimulateScreen({ onBack, risk }: { onBack: () => void; risk: RiskState 
           </button>
         ))}
       </div>
-      <div className="space-y-3 mb-5">
-        <div className="flex gap-3">
-          <div className="flex-1 bg-[#e6f7f5] rounded-xl p-3">
-            <p className="text-[10px] font-semibold text-[#2a9d8f] uppercase mb-2" style={{ letterSpacing:"0.08em" }}>Pros</p>
-            {d.pros.map((p) => <p key={p} className="text-xs text-[var(--color-foreground)] mb-1">↑ {p}</p>)}
-          </div>
-          <div className="flex-1 bg-[var(--color-warning-bg)] rounded-xl p-3">
-            <p className="text-[10px] font-semibold text-[var(--color-warning)] uppercase mb-2" style={{ letterSpacing:"0.08em" }}>Cons</p>
-            {d.cons.map((c) => <p key={c} className="text-xs text-[var(--color-foreground)] mb-1">↓ {c}</p>)}
-          </div>
-        </div>
-        <div className="flex gap-3">
-          <div className="flex-1 bg-[var(--color-muted)] rounded-xl p-3">
-            <p className="text-[10px] font-semibold text-[var(--color-muted-foreground)] uppercase mb-1" style={{ letterSpacing:"0.08em" }}>Risk</p>
-            <p className="text-sm font-medium text-[var(--color-foreground)]">{resultado ? NIVEL_LABEL_EN[resultado.riesgo] : (loading ? "…" : "—")}</p>
-          </div>
-          <div className="flex-1 bg-[var(--color-secondary)] rounded-xl p-3">
-            <p className="text-[10px] font-semibold text-[var(--color-primary)] uppercase mb-1" style={{ letterSpacing:"0.08em" }}>Opportunity cost (12m)</p>
-            <p className="text-xs text-[var(--color-foreground)]">{sim ? `$${Math.round(sim.costo_oportunidad_12m).toLocaleString()}` : "—"}</p>
-          </div>
-        </div>
-      </div>
-      {parsed > 0 && (
-        <>
-          <HairlineRule className="mb-4"/>
-          {loading && !sim ? (
-            <p className="text-sm text-[var(--color-muted-foreground)]">Running the numbers…</p>
-          ) : resultado ? (
-            <div className="space-y-3">
-              <div className="flex justify-between items-center">
-                <p className="text-sm text-[var(--color-muted-foreground)]">Savings after</p>
-                <p style={{ fontFamily:"var(--font-serif)" }} className="text-base text-[var(--color-foreground)]">
-                  ${resultado.ahorro_resultante.toLocaleString("en-US",{minimumFractionDigits:2})}
-                </p>
-              </div>
-              <div className="flex justify-between items-center">
-                <p className="text-sm text-[var(--color-muted-foreground)]">Cushion estimate</p>
-                <p className={`text-base font-semibold ${
-                  resultado.meses_colchon>=3?"text-[#2a9d8f]":resultado.meses_colchon>=1?"text-[var(--color-warning)]":"text-[#c0392b]"}`}>
-                  {Math.max(0,resultado.meses_colchon).toFixed(1)} months
-                </p>
-              </div>
-              {resultado.descubierto && (
-                <p className="text-xs font-medium text-[#c0392b]">⚠ This would leave you overdrawn.</p>
-              )}
-              {sim?.texto && (
-                <SpeechBubble className="mt-2">
-                  <FormattedText text={sim.texto} className="text-sm text-[var(--color-foreground)]"/>
-                </SpeechBubble>
-              )}
+
+      {parsed <= 0 ? (
+        <p className="text-sm text-[var(--color-muted-foreground)]">Enter an amount to see the pros, cons, and risk of {d.label.toLowerCase()}.</p>
+      ) : loading && !detalle ? (
+        <p className="text-sm text-[var(--color-muted-foreground)]">Running the numbers…</p>
+      ) : detalle ? (
+        <div className="space-y-3">
+          <div className="flex gap-3">
+            <div className="flex-1 bg-[#e6f7f5] rounded-xl p-3">
+              <p className="text-[10px] font-semibold text-[#2a9d8f] uppercase mb-2" style={{ letterSpacing:"0.08em" }}>Pros</p>
+              <FormattedText text={detalle.pros} className="text-xs text-[var(--color-foreground)] leading-relaxed"/>
             </div>
-          ) : (
-            <p className="text-sm text-[var(--color-muted-foreground)]">Couldn't reach the server — try again.</p>
-          )}
-        </>
+            <div className="flex-1 bg-[var(--color-warning-bg)] rounded-xl p-3">
+              <p className="text-[10px] font-semibold text-[var(--color-warning)] uppercase mb-2" style={{ letterSpacing:"0.08em" }}>Cons</p>
+              <FormattedText text={detalle.cons} className="text-xs text-[var(--color-foreground)] leading-relaxed"/>
+            </div>
+          </div>
+          <div className="bg-[var(--color-muted)] rounded-xl p-3">
+            <p className="text-[10px] font-semibold text-[var(--color-muted-foreground)] uppercase mb-2" style={{ letterSpacing:"0.08em" }}>Risk</p>
+            <FormattedText text={detalle.risk} className="text-xs text-[var(--color-foreground)] leading-relaxed"/>
+          </div>
+        </div>
+      ) : (
+        <p className="text-sm text-[var(--color-muted-foreground)]">Couldn't reach the server — try again.</p>
       )}
     </div>
   );
@@ -1019,7 +1049,7 @@ function TransferScreen({ onBack, risk, accounts, onMutated }:
     if (!isReady) { setPreview(null); return; }
     const t = setTimeout(() => {
       setPreviewLoading(true);
-      transferirPreview(ACCOUNT_BACKEND_KEY[from as AccountId], ACCOUNT_BACKEND_KEY[to as AccountId], parseFloat(amount))
+      transferirPreview(ACCOUNT_BACKEND_KEY[from as AccountId], ACCOUNT_BACKEND_KEY[to as AccountId], parseFloat(amount), perfilPayload())
         .then((r) => setPreview(r))
         .catch(() => setPreview(null))
         .finally(() => setPreviewLoading(false));
@@ -1033,7 +1063,7 @@ function TransferScreen({ onBack, risk, accounts, onMutated }:
     setErrorMsg(null);
     try {
       // POST /transferencia — actually moves the money.
-      const r = await transferir(ACCOUNT_BACKEND_KEY[from as AccountId], ACCOUNT_BACKEND_KEY[to as AccountId], parseFloat(amount));
+      const r = await transferir(ACCOUNT_BACKEND_KEY[from as AccountId], ACCOUNT_BACKEND_KEY[to as AccountId], parseFloat(amount), perfilPayload());
       if (!r.ok) {
         setErrorMsg(r.texto || "That transfer didn't go through.");
         return;
@@ -1194,14 +1224,15 @@ function DepositScreen({ onBack, risk, accounts, onMutated }:
 }
 
 // ─── Home screen ──────────────────────────────────────────────────────────────
-function HomeScreen({ risk, usuario, cuentas, riesgo, plan, goals, accounts, onNav }: {
+function HomeScreen({ risk, usuario, cuentas, riesgo, plan, goals, accountGoals, onSetGoal, accounts, onNav }: {
   risk: RiskState; usuario: Usuario; cuentas: Cuentas; riesgo: Riesgo; plan: Plan | null;
-  goals: string[]; accounts: Account[]; onNav: (s: Screen) => void;
+  goals: string[]; accountGoals: AccountGoals; onSetGoal: SetAccountGoal;
+  accounts: Account[]; onNav: (s: Screen) => void;
 }) {
   const cfg = RISK_STYLE[risk];
   const [showCR, setShowCR]         = useState(false);
   const [openAccount, setOpenAccount] = useState<AccountId | null>(null);
-  const cr = creditReadiness(riesgo, plan, goals);
+  const cr = creditReadiness(riesgo, plan, cuentas, goals, accountGoals);
   const checkingAcc = accounts.find((a) => a.id === "checking");
   const otherAccounts = accounts.filter((a) => a.id !== "checking");
 
@@ -1312,14 +1343,17 @@ function HomeScreen({ risk, usuario, cuentas, riesgo, plan, goals, accounts, onN
         <p className="text-[10px] font-semibold uppercase text-[var(--color-muted-foreground)] mb-3" style={{ letterSpacing:"0.12em" }}>Safe to Save</p>
         <p style={{ fontFamily:"var(--font-serif)" }} className="text-4xl text-[#2a9d8f] mb-3">${safeToSave}</p>
         {(() => {
-          const top = topBucket(plan, goals);
+          const top = topBucket(plan, cuentas, goals, accountGoals);
           return (
-            <div className="flex items-center justify-between rounded-xl px-4 py-3 border border-[#2a9d8f] bg-[#e6f7f5]">
-              <p className="text-sm font-medium text-[#2a9d8f]">{top.label}</p>
-              <div className="flex items-center gap-2">
-                <p className="text-sm text-[#2a9d8f]">${Math.round(top.amount)}</p>
-                <span className="text-[10px] font-bold text-[#2a9d8f] bg-white px-2 py-0.5 rounded-full border border-[#2a9d8f]">Recommended</span>
+            <div className="rounded-xl px-4 py-3 border border-[#2a9d8f] bg-[#e6f7f5]">
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-medium text-[#2a9d8f]">{top.label}</p>
+                <div className="flex items-center gap-2">
+                  <p className="text-sm text-[#2a9d8f]">${Math.round(top.amount)}</p>
+                  <span className="text-[10px] font-bold text-[#2a9d8f] bg-white px-2 py-0.5 rounded-full border border-[#2a9d8f]">Recommended</span>
+                </div>
               </div>
+              <p className="text-xs text-[#2a9d8f] opacity-80 mt-1">{top.reason}</p>
             </div>
           );
         })()}
@@ -1409,12 +1443,12 @@ function HomeScreen({ risk, usuario, cuentas, riesgo, plan, goals, accounts, onN
       </div>
 
       {/* Floating modals */}
-      {showCR                       && <CreditReadinessModal onClose={() => setShowCR(false)} riesgo={riesgo} plan={plan} goals={goals}/>}
-      {openAccount === "checking"   && <CheckingModal   onClose={() => setOpenAccount(null)} cuentas={cuentas} usuario={usuario} plan={plan}/>}
-      {openAccount === "emergency"  && <EmergencyModal  onClose={() => setOpenAccount(null)} cuentas={cuentas} usuario={usuario} plan={plan}/>}
-      {openAccount === "bills"      && <BillsModal      onClose={() => setOpenAccount(null)} cuentas={cuentas}/>}
-      {openAccount === "hysa"       && <HYSAModal       onClose={() => setOpenAccount(null)} cuentas={cuentas} plan={plan} risk={risk}/>}
-      {openAccount === "shortterm"  && <ShortTermModal  onClose={() => setOpenAccount(null)} cuentas={cuentas} plan={plan}/>}
+      {showCR                       && <CreditReadinessModal onClose={() => setShowCR(false)} riesgo={riesgo} plan={plan} cuentas={cuentas} goals={goals} accountGoals={accountGoals}/>}
+      {openAccount === "checking"   && <CheckingModal   onClose={() => setOpenAccount(null)} cuentas={cuentas} usuario={usuario} plan={plan} accountGoals={accountGoals} onSetGoal={onSetGoal}/>}
+      {openAccount === "emergency"  && <EmergencyModal  onClose={() => setOpenAccount(null)} cuentas={cuentas} usuario={usuario} plan={plan} accountGoals={accountGoals} onSetGoal={onSetGoal}/>}
+      {openAccount === "bills"      && <BillsModal      onClose={() => setOpenAccount(null)} cuentas={cuentas} accountGoals={accountGoals} onSetGoal={onSetGoal}/>}
+      {openAccount === "hysa"       && <HYSAModal       onClose={() => setOpenAccount(null)} cuentas={cuentas} plan={plan} risk={risk} accountGoals={accountGoals} onSetGoal={onSetGoal}/>}
+      {openAccount === "shortterm"  && <ShortTermModal  onClose={() => setOpenAccount(null)} cuentas={cuentas} plan={plan} accountGoals={accountGoals} onSetGoal={onSetGoal}/>}
     </>
   );
 }
@@ -1430,7 +1464,17 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState<string | null>(null);
   const [goals, setGoals]     = useState<string[]>(() => readStoredProfile()?.goals.goals ?? []);
+  const [accountGoals, setAccountGoals] = useState<AccountGoals>(() => readAccountGoals());
   const [showProfileFlow, setShowProfileFlow] = useState(false);
+
+  function onSetGoal(key: keyof Cuentas, amount: number | null) {
+    setAccountGoals((prev) => {
+      const next = { ...prev };
+      if (amount != null && amount > 0) next[key] = amount; else delete next[key];
+      writeAccountGoals(next);
+      return next;
+    });
+  }
 
   // Pull a fresh snapshot from the backend. Used on initial load and again
   // after any action that mutates state server-side (transfer, deposit,
@@ -1534,7 +1578,7 @@ export default function App() {
     <div className="min-h-screen" style={{ backgroundColor:"var(--color-background)" }}>
       <header className="sticky top-0 z-10 border-b border-[var(--color-border)] px-6 py-3.5 flex items-center justify-between"
         style={{ backgroundColor:"var(--color-background)" }}>
-        <div className="flex items-center gap-2">
+        <button onClick={() => setShowProfileFlow(true)} aria-label="Edit your profile" className="flex items-center gap-2">
           <div className="w-7 h-7 rounded-full bg-[var(--color-secondary)] border border-[var(--color-border)] flex items-center justify-center">
             <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
               <circle cx="7" cy="4.5" r="2.5" stroke="var(--color-primary)" strokeWidth="1.2"/>
@@ -1542,24 +1586,16 @@ export default function App() {
             </svg>
           </div>
           <p className="text-xs text-[var(--color-muted-foreground)] font-medium">{usuario.nombre}</p>
-        </div>
-        <div className="flex items-center gap-3">
-          <img src={capitalOneLogo} alt="Capital One" className="h-6 object-contain cursor-pointer select-none"
-            onClick={handleLogoTap}/>
-          <button onClick={() => setShowProfileFlow(true)} aria-label="Edit your profile"
-            className="w-7 h-7 rounded-full bg-[var(--color-secondary)] border border-[var(--color-border)] flex items-center justify-center text-[var(--color-primary)] hover:bg-[var(--color-primary)] hover:text-white transition-colors">
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-              <circle cx="7" cy="4.5" r="2.5" stroke="currentColor" strokeWidth="1.2"/>
-              <path d="M1.5 13c0-2.5 2.5-4 5.5-4s5.5 1.5 5.5 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
-            </svg>
-          </button>
-        </div>
+        </button>
+        <img src={capitalOneLogo} alt="Capital One" className="h-6 object-contain cursor-pointer select-none"
+          onClick={handleLogoTap}/>
       </header>
 
       {/* Home screen uses its own responsive grid; secondary screens stay centered narrow */}
       {screen === "home" ? (
         <main className="max-w-md lg:max-w-4xl mx-auto">
-          <HomeScreen risk={risk} usuario={usuario} cuentas={cuentas} riesgo={riesgo} plan={plan} goals={goals} accounts={accounts} onNav={setScreen}/>
+          <HomeScreen risk={risk} usuario={usuario} cuentas={cuentas} riesgo={riesgo} plan={plan} goals={goals}
+            accountGoals={accountGoals} onSetGoal={onSetGoal} accounts={accounts} onNav={setScreen}/>
         </main>
       ) : (
         <main className="max-w-md lg:max-w-xl mx-auto lg:px-0">

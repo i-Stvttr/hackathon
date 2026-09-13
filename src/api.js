@@ -24,8 +24,10 @@ export const reiniciar = () => pedir("/reiniciar", cuerpo("POST", {}));
 
 export const simular = (monto, meses_posponer = 6) =>
   pedir("/simulacion", cuerpo("POST", { monto, meses_posponer }));
-export const transferirPreview = (origen, destino, monto) =>
-  pedir("/transferencia/preview", cuerpo("POST", { origen, destino, monto }));
-export const transferir = (origen, destino, monto) =>
-  pedir("/transferencia", cuerpo("POST", { origen, destino, monto }));
-export const chatear = (texto) => pedir("/chat", cuerpo("POST", { texto }));
+export const simularDetalle = (monto, escenario, perfil, meses_posponer = 6) =>
+  pedir("/simulacion/detalle", cuerpo("POST", { monto, meses_posponer, escenario, perfil }));
+export const transferirPreview = (origen, destino, monto, perfil) =>
+  pedir("/transferencia/preview", cuerpo("POST", { origen, destino, monto, perfil }));
+export const transferir = (origen, destino, monto, perfil) =>
+  pedir("/transferencia", cuerpo("POST", { origen, destino, monto, perfil }));
+export const chatear = (texto, perfil) => pedir("/chat", cuerpo("POST", { texto, perfil }));

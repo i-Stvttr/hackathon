@@ -11,7 +11,14 @@ export function editarCuentas(campos: Record<string, unknown>): Promise<any>;
 export function aplicarPreset(nombre: string): Promise<any>;
 export function reiniciar(): Promise<any>;
 
+export interface Perfil {
+  goals: string[];
+  predictability?: string | null;
+  recurring?: string | null;
+}
+
 export function simular(monto: number, meses_posponer?: number): Promise<any>;
-export function transferirPreview(origen: string, destino: string, monto: number): Promise<any>;
-export function transferir(origen: string, destino: string, monto: number): Promise<any>;
-export function chatear(texto: string): Promise<any>;
+export function simularDetalle(monto: number, escenario: string, perfil?: Perfil, meses_posponer?: number): Promise<any>;
+export function transferirPreview(origen: string, destino: string, monto: number, perfil?: Perfil): Promise<any>;
+export function transferir(origen: string, destino: string, monto: number, perfil?: Perfil): Promise<any>;
+export function chatear(texto: string, perfil?: Perfil): Promise<any>;
